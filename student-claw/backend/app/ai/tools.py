@@ -1,11 +1,14 @@
 """
-Agnes AI tool definitions + executors (blueprint §3.3).
+Agnes AI tool definitions + executors.
 
-Holds the four OpenAI-standard function schemas and the server-side handlers
-that execute them. Security invariant (§8.1): the authoritative `chat_id` is
-injected by the backend on every call; any `chat_id` the model emits in its
-arguments is IGNORED and overwritten. This makes cross-project access via
-prompt injection impossible.
+Holds the OpenAI-standard function schemas and the server-side handlers that
+execute them. The toolset is mode-aware: every group gets chat-history search
+and date saving; the legacy "projects" mode additionally keeps the old
+task-delegation and contribution-scoring tools.
+
+Security invariant: the authoritative `chat_id` is injected by the backend on
+every call; any `chat_id` the model emits in its arguments is IGNORED and
+overwritten. This makes cross-group access via prompt injection impossible.
 """
 
 from __future__ import annotations
@@ -21,170 +24,213 @@ logger = logging.getLogger("student_claw.ai.tools")
 
 
 # ---------------------------------------------------------------------------
-# Tool JSON schemas (verbatim per §3.3)
+# Tool JSON schemas
 # ---------------------------------------------------------------------------
-TOOLS: list[dict[str, Any]] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "upsert_deadline",
-            "description": (
-                "Extract and store a project deadline when a student explicitly "
-                "mentions a due date or submission date in the conversation. Only "
-                "call this when a date is unambiguously stated. Upsert behavior: if "
-                "a deadline with the same title already exists for this chat_id, "
-                "update its due_date."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": {
-                        "type": "integer",
-                        "description": "The Telegram group chat ID. This is always provided by the system context and must not be inferred from conversation.",
-                    },
-                    "task_title": {
-                        "type": "string",
-                        "description": "A concise, human-readable title for the deadline. Example: 'Final Report Submission'. Maximum 200 characters.",
-                        "maxLength": 200,
-                    },
-                    "due_date": {
-                        "type": "string",
-                        "format": "date-time",
-                        "description": "The deadline in ISO 8601 with timezone. If only a date is mentioned, default to 23:59:00 Singapore Time (UTC+8).",
-                    },
-                    "source_message_id": {
-                        "type": "integer",
-                        "description": "The Telegram message_id of the message that contained the deadline mention.",
-                    },
-                    "confidence": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "description": "Confidence that this is a genuine, explicitly stated deadline. Values below 0.7 should not trigger this tool.",
-                    },
+_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_chat_history",
+        "description": (
+            "Semantically search everything this group has ever shared — chat "
+            "messages, photos (OCR'd), PDFs and slides — to recall specific "
+            "past information. Use this before answering any question about "
+            "things that happened outside the recent-messages window (old "
+            "plans, who said what, contents of shared files, past bills)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Provided by the system context; never infer it.",
                 },
-                "required": ["chat_id", "task_title", "due_date", "source_message_id", "confidence"],
-                "additionalProperties": False,
+                "query": {
+                    "type": "string",
+                    "description": "Semantic search query. Rephrase the user's question for similarity search.",
+                    "maxLength": 500,
+                },
+                "content_type_filter": {
+                    "type": "string",
+                    "enum": ["all", "text", "image", "document"],
+                    "description": "Optionally restrict to a content type. Default 'all'.",
+                    "default": "all",
+                },
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Number of results. Default 8.", "default": 8},
             },
+            "required": ["chat_id", "query"],
+            "additionalProperties": False,
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "delegate_task",
-            "description": (
-                "Create and assign a task to a specific group member. Only call when: "
-                "(a) a member explicitly volunteers, (b) a member is explicitly assigned "
-                "by another member, or (c) a member's demonstrated expertise makes them "
-                "the unambiguous choice AND delegation was requested. Never assign "
-                "tasks speculatively."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": {"type": "integer", "description": "The Telegram group chat ID from system context."},
-                    "telegram_username": {
-                        "type": "string",
-                        "description": "The Telegram username (without @) of the member receiving the task. Must be a member listed in the project context.",
-                    },
-                    "task_description": {
-                        "type": "string",
-                        "description": "A detailed, actionable description: what to do, relevant context, and completion criteria if discernible.",
-                        "maxLength": 1000,
-                    },
-                    "task_title": {"type": "string", "description": "Short title for the task card. Maximum 200 characters.", "maxLength": 200},
-                    "priority": {
-                        "type": "integer",
-                        "enum": [1, 2, 3],
-                        "description": "1=High (deadline within 48h or explicitly urgent), 2=Medium (default), 3=Low.",
-                    },
-                    "related_deadline_title": {
-                        "type": "string",
-                        "description": "Optional: the task_title of an existing deadline this task contributes to.",
-                        "nullable": True,
-                    },
-                    "delegation_rationale": {
-                        "type": "string",
-                        "description": "Brief explanation of why this person was selected. Stored for transparency.",
-                    },
+}
+
+_SAVE_DATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "save_important_date",
+        "description": (
+            "Save an exam, deadline, or other dated event the group cares "
+            "about (e.g. 'Linear Algebra final on 12 Aug, 9am–11am'). Only "
+            "call when a date is unambiguously stated — never guess dates. "
+            "Upsert behavior: an entry with the same title has its date "
+            "updated instead of duplicating."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Provided by the system context; never infer it.",
                 },
-                "required": ["chat_id", "telegram_username", "task_description", "task_title", "priority", "delegation_rationale"],
-                "additionalProperties": False,
+                "title": {
+                    "type": "string",
+                    "description": "Concise title, e.g. 'Linear Algebra Final (9–11am)'. Include the timing in the title when known. Max 200 chars.",
+                    "maxLength": 200,
+                },
+                "due_date": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "ISO 8601 with timezone. For exams use the START time. If only a date is known, default to 09:00 Singapore Time (UTC+8) for exams and 23:59 for deadlines.",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Confidence this is a genuine, explicitly stated date. Below 0.7 → don't call.",
+                },
             },
+            "required": ["chat_id", "title", "due_date", "confidence"],
+            "additionalProperties": False,
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "log_contribution_metric",
-            "description": (
-                "Score a member's contribution over an evaluation window. Only call "
-                "when explicitly requested by a group member (e.g. '/rate @username'). "
-                "Never call autonomously. Scoring must be evidence-based."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": {"type": "integer", "description": "The Telegram group chat ID from system context."},
-                    "telegram_username": {"type": "string", "description": "The Telegram username (without @) being evaluated."},
-                    "score_value": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 10.0,
-                        "description": "Contribution score 0.00-10.00 (one decimal). Calibrate against the group: equal distribution = 5.0 each.",
-                    },
-                    "score_reason": {
-                        "type": "string",
-                        "description": "Detailed, objective, evidence-based justification citing specific actions. Avoid subjective language.",
-                        "maxLength": 2000,
-                    },
-                    "scoring_window_start": {"type": "string", "format": "date-time", "description": "Start of evaluation period (ISO 8601)."},
-                    "scoring_window_end": {"type": "string", "format": "date-time", "description": "End of evaluation period (ISO 8601). Defaults to now."},
-                    "evidence_message_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Telegram message_ids used as evidence (audit trail).",
-                        "maxItems": 50,
-                    },
+}
+
+_LIST_DATES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_saved_dates",
+        "description": (
+            "List the group's saved exams/deadlines/events, earliest first. "
+            "Call this whenever asked about upcoming exams, papers, deadlines "
+            "or 'when is X'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Provided by the system context; never infer it.",
                 },
-                "required": ["chat_id", "telegram_username", "score_value", "score_reason", "scoring_window_start", "scoring_window_end"],
-                "additionalProperties": False,
+                "include_past": {
+                    "type": "boolean",
+                    "description": "Include dates that already passed. Default false.",
+                    "default": False,
+                },
             },
+            "required": ["chat_id"],
+            "additionalProperties": False,
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_project_context",
-            "description": (
-                "Semantically search the project's stored conversation history, "
-                "documents and files to answer specific questions. Use before "
-                "answering any question that requires recalling specific past "
-                "information not present in the current context window."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": {"type": "integer", "description": "Scopes the search to this project only. Never search across projects."},
-                    "query": {
-                        "type": "string",
-                        "description": "Semantic search query. Rephrase the user's question for similarity search.",
-                        "maxLength": 500,
-                    },
-                    "content_type_filter": {
-                        "type": "string",
-                        "enum": ["all", "text", "image", "document"],
-                        "description": "Optionally restrict to a content type. Default 'all'.",
-                        "default": "all",
-                    },
-                    "top_k": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Number of results. Default 8.", "default": 8},
+}
+
+# ── Legacy (projects mode only) ────────────────────────────────────────────
+_DELEGATE_TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delegate_task",
+        "description": (
+            "LEGACY (projects mode). Create and assign a task to a specific group member. Only call when: "
+            "(a) a member explicitly volunteers, (b) a member is explicitly assigned "
+            "by another member, or (c) a member's demonstrated expertise makes them "
+            "the unambiguous choice AND delegation was requested. Never assign "
+            "tasks speculatively."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "integer", "description": "The Telegram group chat ID from system context."},
+                "telegram_username": {
+                    "type": "string",
+                    "description": "The Telegram username (without @) of the member receiving the task. Must be a member listed in the group context.",
                 },
-                "required": ["chat_id", "query"],
-                "additionalProperties": False,
+                "task_description": {
+                    "type": "string",
+                    "description": "A detailed, actionable description: what to do, relevant context, and completion criteria if discernible.",
+                    "maxLength": 1000,
+                },
+                "task_title": {"type": "string", "description": "Short title for the task card. Maximum 200 characters.", "maxLength": 200},
+                "priority": {
+                    "type": "integer",
+                    "enum": [1, 2, 3],
+                    "description": "1=High (deadline within 48h or explicitly urgent), 2=Medium (default), 3=Low.",
+                },
+                "related_deadline_title": {
+                    "type": "string",
+                    "description": "Optional: the title of an existing deadline this task contributes to.",
+                    "nullable": True,
+                },
+                "delegation_rationale": {
+                    "type": "string",
+                    "description": "Brief explanation of why this person was selected. Stored for transparency.",
+                },
             },
+            "required": ["chat_id", "telegram_username", "task_description", "task_title", "priority", "delegation_rationale"],
+            "additionalProperties": False,
         },
     },
-]
+}
+
+_CONTRIBUTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "log_contribution_metric",
+        "description": (
+            "LEGACY (projects mode). Score a member's contribution over an evaluation window. Only call "
+            "when explicitly requested by a group member. Never call autonomously. "
+            "Scoring must be evidence-based."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {"type": "integer", "description": "The Telegram group chat ID from system context."},
+                "telegram_username": {"type": "string", "description": "The Telegram username (without @) being evaluated."},
+                "score_value": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 10.0,
+                    "description": "Contribution score 0.00-10.00 (one decimal). Calibrate against the group: equal distribution = 5.0 each.",
+                },
+                "score_reason": {
+                    "type": "string",
+                    "description": "Detailed, objective, evidence-based justification citing specific actions.",
+                    "maxLength": 2000,
+                },
+                "scoring_window_start": {"type": "string", "format": "date-time", "description": "Start of evaluation period (ISO 8601)."},
+                "scoring_window_end": {"type": "string", "format": "date-time", "description": "End of evaluation period (ISO 8601). Defaults to now."},
+                "evidence_message_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Telegram message_ids used as evidence (audit trail).",
+                    "maxItems": 50,
+                },
+            },
+            "required": ["chat_id", "telegram_username", "score_value", "score_reason", "scoring_window_start", "scoring_window_end"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# Every mode gets these.
+_CORE_TOOLS: list[dict[str, Any]] = [_SEARCH_TOOL, _SAVE_DATE_TOOL, _LIST_DATES_TOOL]
+
+# Kept for backwards compatibility with existing imports.
+TOOLS: list[dict[str, Any]] = _CORE_TOOLS
+
+
+def tools_for_mode(mode: str | None) -> list[dict[str, Any]]:
+    """The toolset exposed to the agent for a given group mode."""
+    if mode == "projects":
+        return _CORE_TOOLS + [_DELEGATE_TASK_TOOL, _CONTRIBUTION_TOOL]
+    return _CORE_TOOLS
 
 
 class ToolExecutionError(Exception):
@@ -210,10 +256,10 @@ async def execute_tool(name: str, arguments: dict[str, Any], *, chat_id: int) ->
     Raises ToolExecutionError for unknown tools or malformed required args.
     """
     args = dict(arguments or {})
-    args["chat_id"] = chat_id  # security override (§8.1)
+    args["chat_id"] = chat_id  # security override
 
     try:
-        if name == "search_project_context":
+        if name == "search_chat_history":
             results = await pipeline.semantic_search(
                 chat_id=chat_id,
                 query=args["query"],
@@ -222,15 +268,30 @@ async def execute_tool(name: str, arguments: dict[str, Any], *, chat_id: int) ->
             )
             return _format_search_results(results)
 
-        if name == "upsert_deadline":
+        if name == "save_important_date":
             res = await repository.upsert_deadline(
                 chat_id=chat_id,
-                task_title=args["task_title"],
+                task_title=args["title"],
                 due_date=_parse_dt(args["due_date"]),
                 confidence=float(args.get("confidence", 0.0)),
-                source_message_id=args.get("source_message_id"),
             )
             return _format_write(res)
+
+        if name == "list_saved_dates":
+            dates = await repository.list_upcoming_dates(
+                chat_id, include_past=bool(args.get("include_past", False))
+            )
+            if dates is None:
+                return json.dumps({"ok": False, "detail": "Group not registered."})
+            return json.dumps(
+                {
+                    "ok": True,
+                    "dates": [
+                        {"title": d.title, "due_date": d.due_date.isoformat()}
+                        for d in dates
+                    ],
+                }
+            )
 
         if name == "delegate_task":
             res = await repository.delegate_task(
@@ -270,7 +331,7 @@ def _format_write(res: repository.ToolWriteResult) -> str:
 
 def _format_search_results(results: list[pipeline.SearchResult]) -> str:
     if not results:
-        return json.dumps({"results": [], "note": "No relevant project context found."})
+        return json.dumps({"results": [], "note": "No relevant chat history found."})
     return json.dumps(
         {
             "results": [

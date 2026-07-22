@@ -1,21 +1,23 @@
 """
-Telegram update handlers for Student Claw (Module 2).
+Telegram update handlers for Agnes — the group-chat companion.
 
 Implements:
-  * /start, /help                         — basic commands
-  * bot-added-to-group detection          — my_chat_member + new_chat_members
-  * /verify {token}                        — Phase 4 identity verification
-  * passive text/image/document listener   — RAG ingestion foundation
+  * /start, /help, /init                   — onboarding
+  * fun & useful commands                  — /ask /summary /news /joke /roast
+                                             /exams /splitbill /paynow …
+  * bot-added-to-group detection           — my_chat_member + new_chat_members
+  * passive text/image/document listener   — RAG ingestion + @mention replies
+  * legacy web-dashboard linkage           — /verify (hidden; kept for hackathons)
 
-Handlers are deliberately thin: all DB work is delegated to app.bot.services,
-each call being its own transaction. Domain events are emitted best-effort via
-app.bot.events for the web dashboard's real-time sync.
+Handlers are deliberately thin: all DB work is delegated to app.bot.services
+(and app.bot.billsplit for bills), each call being its own transaction.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import random
 import re
@@ -40,40 +42,44 @@ from telegram.ext import (
     filters,
 )
 
-from app.ai import pipeline, queue, storage
+from app.ai import pipeline, queue, repository, storage
 from app.ai.agent import run_agent
-from app.bot import events, modes, services
+from app.bot import billsplit, events, modes, news, services
 from app.bot.config import MAX_FILE_SIZE_BYTES
 from app.database.models import ContentType, ProjectStatus
 
 logger = logging.getLogger("student_claw.bot.handlers")
+
+_SGT = ZoneInfo("Asia/Singapore")
+
+# Texts shorter than this are logged but not embedded — "ok", "lol" and
+# stickers-adjacent noise only pollute the vector index.
+_MIN_EMBED_TEXT_CHARS = 12
 
 
 # ---------------------------------------------------------------------------
 # Message copy
 # ---------------------------------------------------------------------------
 PRIVACY_NOTICE = (
-    "ℹ️ Student Claw stores this group's messages to power task tracking, "
-    "deadline extraction and project Q&A. A project lead can clear stored "
-    "context anytime with /clearcache."
+    "ℹ️ I remember this group's messages and files so I can recap chats, "
+    "answer questions and split bills. An admin can wipe my memory anytime "
+    "from the /sc menu."
 )
 
 
-def _welcome_text(project_key: str, project_name: str) -> str:
+def _welcome_text() -> str:
     return (
-        "✅ *Student Claw activated\\!*\n\n"
-        f"*Project:* {_md(project_name)}\n"
-        f"*Project Key:* `{project_key}`\n\n"
-        "Share this key in the web dashboard to link your account, then send "
-        "`/verify <token>` here to complete verification\\.\n\n"
-        f"{_md(PRIVACY_NOTICE)}"
+        "👋 <b>Hey, I'm Agnes!</b> Your group chat's resident AI.\n\n"
+        "Things I'm good at:\n"
+        "🧾 <b>/splitbill</b> — snap a receipt, tap what you ate, I handle "
+        "GST, service charge and who PayNows whom\n"
+        "📰 <b>/news</b> — today's headlines, summarised with opinions\n"
+        "😂 <b>/joke</b> &amp; 🔥 <b>/roast</b> — entertainment on demand\n"
+        "📋 <b>/summary</b> — catch up on what you missed\n"
+        "📚 <b>/exams</b> — I remember your exam dates and timings\n"
+        "💬 <b>/ask</b> anything — or just @mention me\n\n"
+        f"{PRIVACY_NOTICE}"
     )
-
-
-def _md(text: str) -> str:
-    """Escape text for Telegram MarkdownV2."""
-    specials = r"_*[]()~`>#+-=|{}.!\\"
-    return "".join(f"\\{c}" if c in specials else c for c in text)
 
 
 # ---------------------------------------------------------------------------
@@ -82,40 +88,40 @@ def _md(text: str) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        # Ensure the project exists (handles the case where the bot was added
-        # before this handler shipped, or join events were missed).
+        # Ensure the group is registered (handles the case where the bot was
+        # added before this handler shipped, or join events were missed).
         result = await services.get_or_create_project(chat.id, chat.title or "")
         await update.effective_message.reply_text(
-            _welcome_text(result.project_key, result.name),
-            parse_mode="MarkdownV2",
+            _welcome_text(), parse_mode="HTML"
         )
+        if result.created:
+            await update.effective_message.reply_text(
+                "👉 Run /init to pick this group's vibe and become its admin."
+            )
     else:
         await update.effective_message.reply_text(
-            "👋 Add me to your project group chat to get started. "
-            "I'll give you a Project Key to link in the web dashboard."
+            "👋 I'm Agnes — add me to a group chat with your friends and "
+            "run /init there to get started."
         )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "Student Claw commands:\n"
-        "/start — show this group's Project Key\n"
-        "/verify <token> — link your web account (run inside the group)\n"
-        "/ask <question> — ask Agnes anything about this project\n"
-        "/summary — project status briefing\n"
-        "/assign_work [focus] — delegate outstanding tasks to members\n"
-        "/project_goals — state the project's goals\n"
-        "/deadline [name] — list (and capture) deadlines\n"
-        "/sync — ingest all shared files (OCR + index)\n"
-        "/change_details — menu to edit goals, deadlines or tasks\n"
-        "/setgoals <text> — set the project goals\n"
-        "/status — set project status (upcoming/active/completed)\n"
-        "/clear — wipe the project's vector memory\n"
-        "/celebrate — end-of-project wrap-up 🎉\n"
-        "/hehe — a joke to cheer the team up\n"
-        "/deactivate — (admin) pause the bot in this group\n"
-        "/activate — (admin) resume the bot\n"
-        "/help — show this help"
+        "<b>Agnes commands</b>\n\n"
+        "💬 /ask &lt;anything&gt; — questions, ideas, settle debates (or just @mention me)\n"
+        "📋 /summary — recap what's been happening in the chat\n"
+        "📰 /news [sg|world|tech|sport|business] — summarised headlines\n"
+        "😂 /joke [topic] — an actually funny joke\n"
+        "🔥 /roast &lt;name&gt; — playful roast, powered by chat receipts\n"
+        "📚 /exams — upcoming exams &amp; deadlines (add: /exams add Math final 12 Aug 9am)\n\n"
+        "🧾 <b>Bill splitting</b>\n"
+        "/splitbill — reply to a receipt photo; tap items to claim them\n"
+        "/bill — reopen the current bill's claim board\n"
+        "/paynow &lt;mobile&gt; — save your PayNow so friends can pay you\n"
+        "/add_expense 15 pizza · /list_expenses · /settle_up — quick ledger\n\n"
+        "⚙️ /sc — full menu (sync files, mode, admin, memory)\n"
+        "🕶 Legacy: /verify links the old web dashboard (hackathon feature)",
+        parse_mode="HTML",
     )
 
 
@@ -149,13 +155,13 @@ async def _register_and_welcome(chat: Chat, context: ContextTypes.DEFAULT_TYPE) 
     try:
         await context.bot.send_message(
             chat_id=chat.id,
-            text=_welcome_text(result.project_key, result.name),
-            parse_mode="MarkdownV2",
+            text=_welcome_text(),
+            parse_mode="HTML",
         )
         if result.created:
             await context.bot.send_message(
                 chat_id=chat.id,
-                text="👉 Run /init to choose this group's mode and become its admin.",
+                text="👉 Run /init to pick this group's vibe and become its admin.",
             )
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Could not send welcome message to %s: %s", chat.id, exc)
@@ -208,7 +214,7 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sender = update.effective_user
 
     if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await msg.reply_text("Run /verify inside your project group chat.")
+        await msg.reply_text("Run /verify inside the group chat (legacy web-dashboard linking).")
         return
 
     if not context.args:
@@ -347,7 +353,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await msg.reply_text("🎯 Goal added." if ok else "⚠️ Couldn't add goal.")
         elif awaiting["action"] == "details":
             ok = await services.update_project_details(chat.id, value)
-            await msg.reply_text("✏️ Project name updated." if ok else "⚠️ Couldn't update.")
+            await msg.reply_text("✏️ Group name updated." if ok else "⚠️ Couldn't update.")
+        elif awaiting["action"] == "member_add":
+            # "Bala @balaji05" / "@balaji05 Bala" / "Bala" — the @token (if
+            # any) is the handle, the rest is the display name.
+            tokens = value.split()
+            handle = next((t for t in tokens if t.startswith("@")), None)
+            name = " ".join(t for t in tokens if not t.startswith("@")).strip()
+            if not name and handle:
+                name = handle.lstrip("@")
+            ok = bool(name) and await services.upsert_group_member(
+                chat.id, name, handle, sender.id if sender else None
+            )
+            if ok:
+                label = name + (f" ({handle})" if handle else "")
+                await msg.reply_text(f"👥 Added <b>{_md_escape_min(label)}</b>.", parse_mode="HTML")
+            else:
+                await msg.reply_text("⚠️ Couldn't add that. Format: Name @handle")
         return
 
     content_type, raw_text, file_mime_type = _classify_content(update)
@@ -379,12 +401,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     received_at = msg.date or datetime.now(timezone.utc)
 
+    # Fall back to the sender's first name so people without a public
+    # @username still show up in Agnes's roster and recaps.
+    sender_name = (sender.username or sender.first_name) if sender else None
+    sender_name = sender_name[:50] if sender_name else None  # column limit
+
     log_id = await services.log_incoming_message(
         chat_id=chat.id,
         telegram_message_id=msg.message_id,
         content_type=content_type,
         sender_telegram_user_id=sender.id if sender else None,
-        sender_telegram_username=sender.username if sender else None,
+        sender_telegram_username=sender_name,
         received_at=received_at,
         raw_text=raw_text,
         file_mime_type=file_mime_type,
@@ -395,10 +422,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.debug("Message in unregistered chat_id=%s ignored.", chat.id)
         return
 
-    # Enqueue async vectorization for content we can embed.
+    # Enqueue async vectorization for content we can embed. Trivially short
+    # texts ("ok", "lol") are logged for the recap window but skipped for
+    # embedding — they only pollute the vector index.
     if content_type in (ContentType.text, ContentType.image, ContentType.document):
-        # Text needs actual content; media needs a stored file.
-        has_payload = bool(raw_text) if content_type == ContentType.text else bool(file_storage_path)
+        if content_type == ContentType.text:
+            has_payload = bool(raw_text) and len(raw_text.strip()) >= _MIN_EMBED_TEXT_CHARS
+        else:
+            has_payload = bool(file_storage_path)
         if has_payload:
             await queue.enqueue_embed_job(
                 message_log_id=log_id,
@@ -406,9 +437,35 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 content_type=content_type.value,
             )
 
+    # A receipt photo captioned "/splitbill" starts a bill split directly
+    # (CommandHandler only sees text messages, not captions).
+    if content_type == ContentType.image and (msg.caption or "").strip().lower().startswith("/splitbill"):
+        await billsplit.splitbill_command(update, context)
+        return
+
+    # @mentioning Agnes (or replying to her) is the same as /ask — general
+    # queries without anyone needing to remember a command.
+    if content_type == ContentType.text and raw_text:
+        bot_username = (context.bot.username or "").lower()
+        mentioned = bool(bot_username) and f"@{bot_username}" in raw_text.lower()
+        reply_to_bot = (
+            msg.reply_to_message is not None
+            and msg.reply_to_message.from_user is not None
+            and msg.reply_to_message.from_user.id == context.bot.id
+        )
+        if mentioned or reply_to_bot:
+            question = re.sub(
+                rf"@{re.escape(context.bot.username or '')}", "", raw_text, flags=re.IGNORECASE
+            ).strip()
+            if question:
+                # The passive listener already logged the question row.
+                await _deferred_agent(
+                    update, context, user_message=question, log_question=False
+                )
+            return
+
     logger.debug(
-        "Logged message_log=%s chat_id=%s type=%s (enqueued for embedding)",
-        log_id, chat.id, content_type.value,
+        "Logged message_log=%s chat_id=%s type=%s", log_id, chat.id, content_type.value
     )
 
 
@@ -421,12 +478,15 @@ async def _deferred_agent(
     *,
     user_message: str,
     system_directive: str | None = None,
+    fallback_text: str | None = None,
+    log_question: bool = True,
 ) -> None:
     """
     Reply with an immediate "🤔 Thinking…" placeholder, run the agent in a
     background task (so the webhook returns within Telegram's 10s window), then
     edit the placeholder with the final answer. The agent itself handles the
-    OpenRouter/Gemini fallback (Requirement 2).
+    OpenRouter/Gemini fallback. `fallback_text` (if given) replaces error
+    replies so commands like /joke always deliver something.
     """
     chat = update.effective_chat
     msg = update.effective_message
@@ -441,6 +501,8 @@ async def _deferred_agent(
         except Exception as exc:  # run_agent already guards; defend anyway
             logger.exception("Agent crashed in deferred task: %s", exc)
             answer = "⚠️ Something went wrong. Please try again."
+        if fallback_text and answer.startswith("⚠️"):
+            answer = fallback_text
 
         try:
             await context.bot.edit_message_text(
@@ -468,6 +530,7 @@ async def _deferred_agent(
                 answer=answer,
                 q_message_id=msg.message_id,
                 a_message_id=placeholder.message_id,
+                include_question=log_question,
             )
         except Exception as exc:
             logger.warning("Failed to log agent interaction: %s", exc)
@@ -481,12 +544,12 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = update.effective_message
 
     if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await msg.reply_text("Ask me inside your project group chat.")
+        await msg.reply_text("Ask me inside your group chat.")
         return
 
     question = " ".join(context.args).strip() if context.args else ""
     if not question:
-        await msg.reply_text("Usage: /ask <your question about the project>")
+        await msg.reply_text("Usage: /ask <anything> — or just @mention me in chat.")
         return
 
     await _deferred_agent(update, context, user_message=question)
@@ -496,33 +559,49 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Structured agent commands (each carries its own Agnes directive)
 # ---------------------------------------------------------------------------
 _SUMMARY_DIRECTIVE = (
-    "The user invoked /summary. Produce a concise project status briefing using "
-    "short bold headings: (1) Recent activity & decisions, (2) Outstanding tasks "
-    "and who owns them, (3) Upcoming deadlines. Base everything strictly on the "
-    "conversation, member roster, and stored context — call search_project_context "
-    "for older details if needed. Never invent. Keep it scannable."
+    "The user invoked /summary — they want to catch up on the chat. Recap "
+    "what's been happening: the main topics, any plans or decisions made "
+    "(with who/when/where if known), anything that still needs someone's "
+    "answer or action, and one funny highlight if there is one. Use short "
+    "bold labels, keep it tight and scannable. Call search_chat_history when "
+    "the recent window isn't enough. Base everything strictly on the actual "
+    "conversation — never invent."
 )
+_JOKE_DIRECTIVE = (
+    "The user invoked /joke. Tell ONE original, genuinely funny joke — no "
+    "stale programming/dad-joke clichés unless they specifically asked for "
+    "that. Best material: this group's recent chat (running gags, what people "
+    "were just talking about, shared misery like exams or bills); otherwise "
+    "sharp observational humour on the requested topic. 1–3 lines, no "
+    "preamble, no explanation — just land the joke."
+)
+_ROAST_DIRECTIVE = (
+    "The user invoked /roast on a named target. Deliver a playful 2–4 line "
+    "comedy roast grounded in the target's ACTUAL behaviour in this chat — "
+    "mine the recent messages and call search_chat_history for receipts "
+    "(always late? left on read? ordered the most expensive dish and "
+    "'forgot' to PayNow?). Punch at behaviour only: never appearance, "
+    "identity, family, or anything genuinely hurtful — this is loving fire "
+    "between friends. If the target isn't in this chat, roast the requester "
+    "for pointing at ghosts. End with a wink so nobody actually cries."
+)
+_EXAMS_ADD_DIRECTIVE = (
+    "The user invoked /exams with details of an exam or deadline. If it "
+    "contains an unambiguous date, save it with save_important_date (include "
+    "the timing, e.g. '9–11am', in the title), then confirm and show the "
+    "updated list via list_saved_dates with a countdown for each. If the "
+    "date is ambiguous, ask exactly one clarifying question instead. Never "
+    "guess dates."
+)
+
+# Legacy projects-mode directives (reachable via old /sc buttons only).
 _ASSIGN_WORK_DIRECTIVE = (
-    "The user invoked /assign_work. Identify concrete outstanding tasks from the "
-    "conversation and delegate each to the most suitable member using the "
-    "delegate_task tool. Choose assignees only from the real roster, based on who "
-    "volunteered, who was assigned, or demonstrated expertise. Set sensible "
-    "priorities and link an existing deadline when relevant. After delegating, "
-    "reply with a short bulleted list of who got what and why. If there is nothing "
-    "concrete to assign, say so rather than inventing work."
-)
-_PROJECT_GOALS_DIRECTIVE = (
-    "The user invoked /project_goals. State this project's goals and objectives "
-    "based on the conversation, module code, and any uploaded documents (use "
-    "search_project_context if helpful). Give 3-6 concise goal bullets. If goals "
-    "were never stated explicitly, infer the most likely objective from context "
-    "and clearly label that section as 'Inferred'."
-)
-_DEADLINE_DIRECTIVE = (
-    "The user invoked /deadline. List all known deadlines for this project sorted "
-    "earliest first, each with its date and what it is for. If the recent "
-    "conversation states a new, unambiguous deadline that isn't recorded yet, "
-    "capture it with the upsert_deadline tool before replying. Never invent dates."
+    "The user asked you to delegate work (legacy projects mode). Identify "
+    "concrete outstanding tasks from the conversation and delegate each to the "
+    "most suitable member using the delegate_task tool. Choose assignees only "
+    "from people actually in the chat. After delegating, reply with a short "
+    "bulleted list of who got what and why. If there is nothing concrete to "
+    "assign, say so rather than inventing work."
 )
 
 
@@ -532,50 +611,113 @@ async def _run_command(
     *,
     directive: str,
     default_message: str,
+    fallback_text: str | None = None,
 ) -> None:
     """Shared runner for the structured agent slash-commands."""
     chat = update.effective_chat
     msg = update.effective_message
     if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await msg.reply_text("Run this inside your project group chat.")
+        await msg.reply_text("Run this inside your group chat.")
         return
 
     # Any extra words after the command become additional focus for Agnes.
     extra = " ".join(context.args).strip() if context.args else ""
     user_message = f"{default_message} {extra}".strip() if extra else default_message
 
-    await _deferred_agent(update, context, user_message=user_message, system_directive=directive)
+    await _deferred_agent(
+        update, context,
+        user_message=user_message,
+        system_directive=directive,
+        fallback_text=fallback_text,
+    )
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_command(
         update, context,
         directive=_SUMMARY_DIRECTIVE,
-        default_message="Summarise the current state of this project.",
+        default_message="Catch me up — what's been happening in this chat?",
     )
 
 
-async def assign_work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_command(
         update, context,
-        directive=_ASSIGN_WORK_DIRECTIVE,
-        default_message="Assign the outstanding work for this project to the team.",
+        directive=_JOKE_DIRECTIVE,
+        default_message="Tell us a joke.",
+        fallback_text=random.choice(_JOKES),
     )
 
 
-async def project_goals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _run_command(
+async def roast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    chat = update.effective_chat
+    if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await msg.reply_text("Roasts happen in the group, where everyone can watch. 🔥")
+        return
+
+    target = " ".join(context.args).strip() if context.args else ""
+    # Replying to someone's message roasts them.
+    if not target and msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        target = u.first_name or (f"@{u.username}" if u.username else "")
+    if not target:
+        await msg.reply_text("Who am I roasting? Use /roast <name> or reply to their message.")
+        return
+
+    await _deferred_agent(
         update, context,
-        directive=_PROJECT_GOALS_DIRECTIVE,
-        default_message="What are the goals and objectives of this project?",
+        user_message=f"Roast {target}.",
+        system_directive=_ROAST_DIRECTIVE,
     )
 
 
-async def deadline_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _run_command(
-        update, context,
-        directive=_DEADLINE_DIRECTIVE,
-        default_message="List all deadlines for this project.",
+async def exams_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List saved exams/deadlines with countdowns; with args, save a new one."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if chat is None or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await msg.reply_text("Use /exams inside your group chat.")
+        return
+
+    args = " ".join(context.args).strip() if context.args else ""
+    if args:
+        # Natural-language add ("/exams add Math final 12 Aug 9am").
+        await _deferred_agent(
+            update, context,
+            user_message=f"Save this exam/deadline: {args}",
+            system_directive=_EXAMS_ADD_DIRECTIVE,
+        )
+        return
+
+    dates = await repository.list_upcoming_dates(chat.id)
+    if dates is None:
+        await msg.reply_text("⚠️ This group isn't registered yet. Send /start first.")
+        return
+    if not dates:
+        await msg.reply_text(
+            "📚 No exams or deadlines saved yet.\n"
+            "Add one with /exams add <what and when>, e.g.\n"
+            "/exams add Linear Algebra final, 12 Aug 9am–11am\n"
+            "…or just mention it in chat and ask me to remember it."
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    lines = []
+    for d in dates:
+        local = d.due_date.astimezone(_SGT)
+        delta = d.due_date - now
+        days, hours = delta.days, delta.seconds // 3600
+        countdown = f"{days}d {hours}h" if days > 0 else (f"{hours}h" if hours > 0 else "soon!")
+        flame = " 🔥" if days <= 3 else ""
+        lines.append(
+            f"• <b>{services._strip_html(d.title)}</b>\n"
+            f"   {local.strftime('%a %d %b %Y, %H:%M')} SGT — in {countdown}{flame}"
+        )
+    await msg.reply_text(
+        "📚 <b>Upcoming exams &amp; deadlines</b>\n\n" + "\n".join(lines),
+        parse_mode="HTML",
     )
 
 
@@ -612,7 +754,7 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
-        await msg.reply_text("Use this inside your project group chat.")
+        await msg.reply_text("Use this inside your group chat.")
         return
     state = await services.get_group_state(chat.id)
     if state is None:
@@ -622,14 +764,14 @@ async def activate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await msg.reply_text("🔒 Only the group admin can activate the bot.")
         return
     await services.set_bot_active(chat.id, True)
-    await msg.reply_text("✅ Student Claw is active again.")
+    await msg.reply_text("✅ Agnes is awake again. Miss me?")
 
 
 async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
-        await msg.reply_text("Use this inside your project group chat.")
+        await msg.reply_text("Use this inside your group chat.")
         return
     state = await services.get_group_state(chat.id)
     if state is None:
@@ -640,7 +782,7 @@ async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await services.set_bot_active(chat.id, False)
     await msg.reply_text(
-        "🔕 Student Claw is now <b>deactivated</b> and will ignore the group. "
+        "🔕 Agnes is now <b>deactivated</b> and will ignore the group. "
         "An admin can wake me with /activate.",
         parse_mode="HTML",
     )
@@ -677,7 +819,7 @@ def _is_group(chat: Chat | None) -> bool:
 
 async def change_details_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_group(update.effective_chat):
-        await update.effective_message.reply_text("Use this inside your project group chat.")
+        await update.effective_message.reply_text("Use this inside your group chat.")
         return
     keyboard = InlineKeyboardMarkup(
         [
@@ -695,7 +837,7 @@ async def setgoals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
-        await msg.reply_text("Use this inside your project group chat.")
+        await msg.reply_text("Use this inside your group chat.")
         return
     goals = " ".join(context.args).strip() if context.args else ""
     if not goals:
@@ -709,7 +851,7 @@ async def setgoals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_group(update.effective_chat):
-        await update.effective_message.reply_text("Use this inside your project group chat.")
+        await update.effective_message.reply_text("Use this inside your group chat.")
         return
     keyboard = InlineKeyboardMarkup(
         [
@@ -727,7 +869,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_group(update.effective_chat):
-        await update.effective_message.reply_text("Use this inside your project group chat.")
+        await update.effective_message.reply_text("Use this inside your group chat.")
         return
     keyboard = InlineKeyboardMarkup(
         [
@@ -738,8 +880,8 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ]
     )
     await update.effective_message.reply_text(
-        "⚠️ Clear this project's vector memory? Files are kept, but Agnes's "
-        "recall of past chat/documents is wiped. This can't be undone.",
+        "⚠️ Wipe my memory of this group? Files are kept, but my recall of "
+        "past chats/documents is gone. This can't be undone.",
         reply_markup=keyboard,
     )
 
@@ -748,7 +890,7 @@ async def celebrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
-        await msg.reply_text("Use this inside your project group chat.")
+        await msg.reply_text("Use this inside your group chat.")
         return
 
     ledger = await services.get_task_ledger(chat.id)
@@ -778,7 +920,8 @@ async def celebrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def hehe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(random.choice(_JOKES))
+    """Legacy alias for /joke."""
+    await joke_command(update, context)
 
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -789,7 +932,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
-        await msg.reply_text("Use this inside your project group chat.")
+        await msg.reply_text("Use this inside your group chat.")
         return
 
     status = await msg.reply_text("🔄 Syncing shared files…")
@@ -807,7 +950,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     await status.edit_text(
         f"🔄 Queued <b>{len(pending)}</b> item(s) for OCR + indexing. "
-        "Give it a minute, then ask me about them with /ask or in the web app.",
+        "Give it a minute, then ask me about them with /ask.",
         parse_mode="HTML",
     )
 
@@ -885,11 +1028,10 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 parse_mode="HTML",
             )
         elif action == "deadlines":
-            await query.edit_message_text("📅 Fetching deadlines…")
+            await query.edit_message_text("📅 Fetching saved dates…")
             await _deferred_agent(
                 update, context,
-                user_message="List all deadlines for this project.",
-                system_directive=_DEADLINE_DIRECTIVE,
+                user_message="List all saved exams and deadlines with a countdown for each.",
             )
         elif action == "tasks":
             await query.edit_message_text("✅ Reviewing work to assign…")
@@ -986,11 +1128,7 @@ async def admin_settings_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-# ── Mode B: Fun / Friend ──
-async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(random.choice(_JOKES))
-
-
+# ── Fun extras ──
 async def meme_prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not _is_group(chat):
@@ -1093,21 +1231,24 @@ async def settle_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ---------------------------------------------------------------------------
 # Unified /sc inline menu + RBAC (app-like UX)
 # ---------------------------------------------------------------------------
-_SC_HEADER = "🤖 <b>Student Claw</b> — pick an option:"
-_DENY = "🔒 Leaders only. Ask a group admin."
+_SC_HEADER = "🤖 <b>Agnes</b> — pick an option:"
+_DENY = "🔒 Admins only. Ask the group admin."
 
 _SC_MENU_HELP = (
-    "<b>Student Claw menu</b>\n\n"
-    "Everything lives in /sc now:\n"
-    "• <b>Summary / Assign Work / Project Goals / Deadlines</b> — Agnes helpers\n"
-    "• <b>Sync</b> — index all shared files (OCR + vectors)\n"
-    "• <b>Set</b> — goals, details, status, roles\n"
-    "• <b>Clear / Activation</b> — leaders only\n"
-    "• <b>Celebrate / Hehe</b> — for the vibes\n\n"
-    "Outside the menu, just type <code>/ask &lt;question&gt;</code>."
+    "<b>Agnes menu</b>\n\n"
+    "• <b>Summary / News / Joke / Exams</b> — the daily drivers\n"
+    "• <b>Bill</b> — reopen the current bill (start one by replying to a "
+    "receipt photo with /splitbill)\n"
+    "• <b>Sync</b> — index all shared files (OCR + memory)\n"
+    "• <b>Set</b> — group mode, name, AI settings\n"
+    "• <b>Clear / Activation</b> — admins only\n\n"
+    "Outside the menu: <code>/ask &lt;anything&gt;</code>, "
+    "<code>/roast &lt;name&gt;</code>, or just @mention me."
 )
 _VERIFY_HELP = (
-    "<b>Link your web account</b>\n"
+    "<b>Legacy: link the web dashboard</b>\n"
+    "The old Student Claw web app still works if you need it for a "
+    "hackathon:\n"
     "1. Register on the dashboard with your Telegram @username.\n"
     "2. Submit your Project Key to get a token.\n"
     "3. Send <code>/verify &lt;token&gt;</code> here in the group."
@@ -1124,15 +1265,14 @@ def _back(to: str = "sc|main") -> list[InlineKeyboardButton]:
 
 def _main_menu_keyboard(state: "services.GroupState", privileged: bool) -> InlineKeyboardMarkup:
     rows = [
-        [_btn("✅ Verify", "sc|verify"), _btn("📋 Summary", "sc|summary")],
-        [_btn("👥 Assign Work", "sc|assign"), _btn("🎯 Project Goals", "sc|goals")],
-        [_btn("📅 Deadlines", "sc|deadlines"), _btn("🔄 Sync", "sc|sync")],
+        [_btn("📋 Summary", "sc|summary"), _btn("📰 News", "sc|news")],
+        [_btn("😂 Joke", "sc|hehe"), _btn("📚 Exams", "sc|deadlines")],
+        [_btn("🧾 Bill", "sc|bill"), _btn("🔄 Sync", "sc|sync")],
     ]
     set_row = [_btn("⚙️ Set", "sc|set")]
     if privileged:
-        set_row.append(_btn("🗑️ Clear", "sc|clear"))
+        set_row.append(_btn("🗑️ Clear memory", "sc|clear"))
     rows.append(set_row)
-    rows.append([_btn("🎉 Celebrate", "sc|celebrate"), _btn("😂 Hehe", "sc|hehe")])
     last: list[InlineKeyboardButton] = []
     if privileged:
         dot = "🟢" if state.bot_active else "🔴"
@@ -1143,12 +1283,44 @@ def _main_menu_keyboard(state: "services.GroupState", privileged: bool) -> Inlin
 
 
 def _set_menu_keyboard(privileged: bool) -> InlineKeyboardMarkup:
-    rows = [[_btn("🎯 Set Goals", "sc|set|goals"), _btn("📊 Set Status", "sc|set|status")]]
+    rows: list[list[InlineKeyboardButton]] = []
     if privileged:
-        rows.append([_btn("✏️ Set Details", "sc|set|details"), _btn("👑 Set Roles", "sc|set|roles")])
-        rows.append([_btn("🔀 Set Mode", "sc|mode"), _btn("⚙️ AI Settings", "sc|am")])
+        rows.append([_btn("👥 Members", "sc|mem"), _btn("🔀 Set Mode", "sc|mode")])
+        rows.append([_btn("✏️ Set Group Name", "sc|set|details"), _btn("⚙️ AI Settings", "sc|am")])
+    else:
+        rows.append([_btn("👥 Members", "sc|mem")])
     rows.append(_back())
     return InlineKeyboardMarkup(rows)
+
+
+def _members_keyboard(members: list[dict]) -> InlineKeyboardMarkup:
+    """Manual roster editor: tap a member to remove, ➕ to add."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for m in members[:20]:
+        label = m["display_name"] + (
+            f" (@{m['telegram_username']})" if m["telegram_username"] else ""
+        )
+        rows.append([_btn(f"❌ {label[:48]}", f"sc|mem|rm|{m['id']}")])
+    rows.append([_btn("➕ Add member", "sc|mem|add")])
+    rows.append(_back("sc|set"))
+    return InlineKeyboardMarkup(rows)
+
+
+def _members_text(members: list[dict]) -> str:
+    if not members:
+        body = "<i>(no members added yet)</i>"
+    else:
+        body = "\n".join(
+            f"• <b>{_md_escape_min(m['display_name'])}</b>"
+            + (f" — @{_md_escape_min(m['telegram_username'])}" if m["telegram_username"] else "")
+            for m in members
+        )
+    return (
+        "👥 <b>Group members</b>\n"
+        "So I know exactly who you mean — for roasts, summaries, bills…\n\n"
+        f"{body}\n\n"
+        "Tap ❌ to remove, or ➕ to add someone (name + @handle)."
+    )
 
 
 def _activation_menu_keyboard() -> InlineKeyboardMarkup:
@@ -1180,7 +1352,7 @@ async def sc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
-        await msg.reply_text("Open the menu inside your project group chat.")
+        await msg.reply_text("Open the menu inside your group chat.")
         return
     state = await services.get_group_state(chat.id)
     if state is None:
@@ -1234,7 +1406,7 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # RBAC: gate sensitive actions even if a stale button is clicked.
     denied = (
-        (action in {"clear", "act", "role", "mode", "am"})
+        (action in {"clear", "act", "role", "mode", "am", "mem"})
         or (action == "set" and sub in {"details", "roles"})
     )
     if denied and not privileged:
@@ -1284,18 +1456,26 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ── Leaf actions reusing existing command logic (new message below the menu) ──
     if action == "summary":
         await query.answer("Summarising…"); await summary_command(update, context); return
-    if action == "assign":
-        await query.answer("Assigning…"); await assign_work_command(update, context); return
-    if action == "goals":
-        await query.answer(); await project_goals_command(update, context); return
+    if action == "news":
+        await query.answer("📰"); await news.news_command(update, context); return
+    if action == "hehe":
+        await query.answer("😂"); await joke_command(update, context); return
     if action == "deadlines":
-        await query.answer(); await deadline_command(update, context); return
+        await query.answer("📚"); await exams_command(update, context); return
+    if action == "bill":
+        await query.answer("🧾"); await billsplit.bill_command(update, context); return
     if action == "sync":
         await query.answer("Syncing…"); await sync_command(update, context); return
-    if action == "celebrate":
+    if action == "celebrate":  # legacy button
         await query.answer("🎉"); await celebrate_command(update, context); return
-    if action == "hehe":
-        await query.answer("😂"); await hehe_command(update, context); return
+    if action == "assign":  # legacy button (projects mode)
+        await query.answer("Assigning…")
+        await _deferred_agent(
+            update, context,
+            user_message="Assign the outstanding work to the team.",
+            system_directive=_ASSIGN_WORK_DIRECTIVE,
+        )
+        return
     if action == "clear":
         await query.answer(); await clear_command(update, context); return  # renders clr: confirm
 
@@ -1304,7 +1484,7 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await services.set_bot_active(chat.id, True)
         await query.answer("Activated ✅")
         await query.edit_message_text(
-            "✅ Student Claw is <b>active</b>.", parse_mode="HTML",
+            "✅ Agnes is <b>active</b>.", parse_mode="HTML",
             reply_markup=_activation_menu_keyboard(),
         )
         return
@@ -1312,7 +1492,7 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await services.set_bot_active(chat.id, False)
         await query.answer("Deactivated 🔕")
         await query.edit_message_text(
-            "🔕 Student Claw is <b>deactivated</b>. Send /activate to wake me.",
+            "🔕 Agnes is <b>deactivated</b>. Send /activate to wake me.",
             parse_mode="HTML",
         )
         return
@@ -1334,6 +1514,28 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             f"✅ This group is now in <b>{label}</b> mode. The command menu has been updated.",
             parse_mode="HTML",
+        )
+        return
+
+    # ── Members (manual roster — replaces web-app registration) ──
+    if action == "mem":
+        if sub == "add":
+            await query.answer()
+            await _prompt_input(
+                update, context, "member_add",
+                "➕ Reply to this with the member's <b>name and @handle</b>, "
+                "e.g. <code>Bala @balaji05</code> (handle optional):",
+            )
+            return
+        if sub == "rm" and len(parts) >= 4:
+            await services.remove_group_member(chat.id, parts[3])
+            await query.answer("Removed")
+        else:
+            await query.answer()
+        members = await services.list_group_members(chat.id) or []
+        await query.edit_message_text(
+            _members_text(members), parse_mode="HTML",
+            reply_markup=_members_keyboard(members),
         )
         return
 
@@ -1428,31 +1630,42 @@ def register_handlers(application) -> None:
     application.add_handler(TypeHandler(Update, state_gate), group=-10)
 
     # ── Commands ──
-    # Only /sc and /ask are exposed to users (the rest moved into the /sc menu).
-    application.add_handler(CommandHandler("sc", sc_command))
+    # ── The daily drivers ──
     application.add_handler(CommandHandler("ask", ask_command))
-    # Hidden-but-functional (not shown in the command menu):
-    #   /activate — wakes the bot when the menu is blocked (deactivated state)
-    #   /verify   — token-based account linking (a button can't carry the token)
-    #   /start    — group registration / welcome
-    application.add_handler(CommandHandler("activate", activate_command))
-    application.add_handler(CommandHandler("verify", verify_command))
-    application.add_handler(CommandHandler("start", start_command))
-
-    # Multi-Mode: onboarding + admin settings (admin-gated inside).
-    application.add_handler(CommandHandler("init", init_command))
-    application.add_handler(CommandHandler("admin_settings", admin_settings_command))
-    # Mode B (Fun/Friend) commands.
+    application.add_handler(CommandHandler("summary", summary_command))
+    application.add_handler(CommandHandler("news", news.news_command))
     application.add_handler(CommandHandler("joke", joke_command))
+    application.add_handler(CommandHandler("hehe", hehe_command))  # legacy alias
+    application.add_handler(CommandHandler("roast", roast_command))
+    application.add_handler(CommandHandler("exams", exams_command))
     application.add_handler(CommandHandler("meme_prompt", meme_prompt_command))
-    # Mode C (Expense Tracker) commands.
+    application.add_handler(CommandHandler("sc", sc_command))
+    application.add_handler(CommandHandler("help", help_command))
+
+    # ── Bills & money ──
+    application.add_handler(CommandHandler("splitbill", billsplit.splitbill_command))
+    application.add_handler(CommandHandler("bill", billsplit.bill_command))
+    application.add_handler(CommandHandler("paynow", billsplit.paynow_command))
     application.add_handler(CommandHandler("add_expense", add_expense_command))
     application.add_handler(CommandHandler("list_expenses", list_expenses_command))
     application.add_handler(CommandHandler("settle_up", settle_up_command))
 
+    # ── Onboarding / admin ──
+    #   /activate — wakes the bot when the menu is blocked (deactivated state)
+    #   /verify   — LEGACY web-dashboard linking (kept for hackathons, hidden)
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("init", init_command))
+    application.add_handler(CommandHandler("admin_settings", admin_settings_command))
+    application.add_handler(CommandHandler("activate", activate_command))
+    application.add_handler(CommandHandler("deactivate", deactivate_command))
+    application.add_handler(CommandHandler("sync", sync_command))
+    application.add_handler(CommandHandler("verify", verify_command))
+
     # ── Callback routers ──
-    # New /sc menu tree (callback_data prefixed `sc|`).
+    # /sc menu tree (callback_data prefixed `sc|`).
     application.add_handler(CallbackQueryHandler(on_sc_callback, pattern=r"^sc\|"))
+    # Bill-split claim board (callback_data prefixed `bl|`).
+    application.add_handler(CallbackQueryHandler(billsplit.on_bill_callback, pattern=r"^bl\|"))
     # Reused confirm/status/legacy sub-flows (colon-delimited prefixes).
     application.add_handler(
         CallbackQueryHandler(on_callback_query, pattern=r"^(st|clr|cd):")

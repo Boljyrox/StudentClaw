@@ -30,10 +30,18 @@ logger = logging.getLogger("student_claw.bot")
 
 _application: Application | None = None
 
-# Commands shown in Telegram's "/" menu.
+# Default commands shown in Telegram's "/" menu (chat-scoped menus override
+# these per group mode — see app.bot.modes).
 _BOT_COMMANDS = [
-    ("sc", "Open the Student Claw menu"),
-    ("ask", "Ask Agnes anything about this project"),
+    ("ask", "Ask Agnes anything"),
+    ("summary", "Catch me up on the chat"),
+    ("news", "Today's news, summarised"),
+    ("joke", "An actually funny joke"),
+    ("roast", "Roast someone (with love)"),
+    ("exams", "Upcoming exams & deadlines"),
+    ("splitbill", "Split a receipt photo"),
+    ("paynow", "Set your PayNow number"),
+    ("sc", "Open the Agnes menu"),
 ]
 
 

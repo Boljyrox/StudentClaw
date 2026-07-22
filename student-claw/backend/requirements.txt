@@ -36,3 +36,6 @@ bcrypt>=4.1
 PyJWT>=2.8
 cryptography>=42.0
 httpx>=0.26.0,<0.27.0
+
+# Bill splitting — PayNow QR generation
+qrcode[pil]>=7.4

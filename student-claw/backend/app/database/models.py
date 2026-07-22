@@ -693,6 +693,183 @@ class Expense(Base):
         return f"<Expense {self.payer_name} {self.amount} {self.description!r}>"
 
 
+# ===========================================================================
+# bills / bill_items / bill_claims  (receipt-based bill splitting)
+# ===========================================================================
+class Bill(Base):
+    """
+    One receipt being split in a group. Created from a receipt photo via
+    /splitbill (VLM OCR), claimed item-by-item with inline buttons, then
+    finalised into a per-person breakdown (GST + service charge split
+    proportionally to what each person ordered).
+    """
+
+    __tablename__ = "bills"
+    __table_args__ = (
+        Index("ix_bills_project_id", "project_id"),
+        Index("ix_bills_chat_id", "chat_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    # The person who paid the bill (ran /splitbill) and should be reimbursed.
+    payer_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    payer_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    merchant: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    currency: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default=text("'SGD'")
+    )
+
+    items_subtotal: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    service_charge: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, server_default=text("0")
+    )
+    gst: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, server_default=text("0")
+    )
+    other_charges: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, server_default=text("0")
+    )
+    discount: Mapped[float] = mapped_column(
+        Numeric(10, 2), nullable=False, server_default=text("0")
+    )
+    total: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+
+    # open | finalized | cancelled
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'open'")
+    )
+    # Telegram message id of the interactive claim keyboard (for re-rendering).
+    menu_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+
+    created_at: Mapped[datetime] = _created_at()
+
+    items: Mapped[list["BillItem"]] = relationship(
+        back_populates="bill", cascade="all, delete-orphan", order_by="BillItem.position"
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<Bill id={self.id} total={self.total} status={self.status}>"
+
+
+class BillItem(Base):
+    """A single line item on a receipt (e.g. '2x Chicken Rice — $9.00')."""
+
+    __tablename__ = "bill_items"
+    __table_args__ = (Index("ix_bill_items_bill_id", "bill_id"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    bill_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("bills.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    quantity: Mapped[float] = mapped_column(
+        Numeric(6, 2), nullable=False, server_default=text("1")
+    )
+    total_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+
+    bill: Mapped["Bill"] = relationship(back_populates="items")
+    claims: Mapped[list["BillClaim"]] = relationship(
+        back_populates="item", cascade="all, delete-orphan"
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<BillItem {self.name!r} {self.total_price}>"
+
+
+class BillClaim(Base):
+    """A person claiming (part of) a bill item. Shared items have many claims."""
+
+    __tablename__ = "bill_claims"
+    __table_args__ = (
+        UniqueConstraint("bill_item_id", "user_id", name="uq_bill_claim_item_user"),
+        Index("ix_bill_claims_item_id", "bill_item_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    bill_item_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("bill_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+    item: Mapped["BillItem"] = relationship(back_populates="claims")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<BillClaim user={self.user_name!r}>"
+
+
+# ===========================================================================
+# group_members  (manual roster — replaces web-app registration)
+# ===========================================================================
+class GroupMember(Base):
+    """
+    A group member added manually via the bot's Settings → Members menu
+    (name + Telegram handle). Lets Agnes resolve real names to handles and
+    know about lurkers who never text — no web-app registration required.
+    """
+
+    __tablename__ = "group_members"
+    __table_args__ = (
+        UniqueConstraint("project_id", "display_name", name="uq_group_member_name"),
+        Index("ix_group_members_project_id", "project_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Without the leading @; nullable for members who have no username.
+    telegram_username: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    added_by_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<GroupMember {self.display_name!r} @{self.telegram_username}>"
+
+
+# ===========================================================================
+# pay_profiles  (PayNow details, one per Telegram user, shared across groups)
+# ===========================================================================
+class PayProfile(Base):
+    """A user's PayNow identifier so settle-ups can say exactly where to pay."""
+
+    __tablename__ = "pay_profiles"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger, unique=True, nullable=False
+    )
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Mobile number in +65XXXXXXXX form (or NRIC/UEN as entered).
+    paynow_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<PayProfile user={self.telegram_user_id} paynow={self.paynow_id!r}>"
+
+
 __all__ = [
     "Base",
     # enums (python)
@@ -715,4 +892,9 @@ __all__ = [
     "ProjectLinkToken",
     "AIRequestLog",
     "Expense",
+    "Bill",
+    "BillItem",
+    "BillClaim",
+    "GroupMember",
+    "PayProfile",
 ]

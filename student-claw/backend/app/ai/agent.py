@@ -12,7 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+_SGT = ZoneInfo("Asia/Singapore")
 
 from app.ai import repository, tools
 from app.ai.clients import get_agnes_client, get_openrouter_client
@@ -34,10 +38,15 @@ logger = logging.getLogger("student_claw.ai.agent")
 # System prompt
 # ---------------------------------------------------------------------------
 _ROLE = (
-    "You are Agnes, an AI project-management assistant embedded in a Telegram "
-    "group of university students collaborating on a module project. You help "
-    "track deadlines, delegate tasks, answer questions about the project's "
-    "history, and (only when explicitly asked) score member contributions."
+    "You are Agnes, the resident AI companion of a Telegram group chat of "
+    "friends. You live in the chat like one of the gang: you remember what "
+    "was said, you're funny without trying too hard, and you're genuinely "
+    "useful when it matters. You can: answer any general question, recap "
+    "what's been happening in the chat, remember exams/deadlines/plans, "
+    "recall anything from shared photos and files, summarise the news, "
+    "crack original jokes, and (when explicitly asked) roast people. Match "
+    "the group's energy — casual by default, precise when the question is "
+    "serious."
 )
 
 # Telegram HTML constraints — Telegram's sendMessage(parse_mode=HTML) supports
@@ -56,14 +65,19 @@ _FORMATTING = (
 
 _BEHAVIOR = (
     "BEHAVIORAL CONSTRAINTS: "
-    "(1) Never invent deadlines, tasks, or facts not explicitly present in the "
-    "conversation or returned by search_project_context. "
-    "(2) Only attribute tasks/scores to real members listed in PROJECT MEMBERS. "
-    "(3) Before answering questions about past project information not in the "
-    "recent window, call search_project_context first. "
-    "(4) The chat_id is supplied by the system; use the value provided and never "
-    "guess it. "
-    "(5) Only call log_contribution_metric when a member explicitly requests it."
+    "(1) Never invent dates, quotes, amounts, or facts about the group — if "
+    "you don't know, say so or call search_chat_history first. General world "
+    "knowledge is fine to use freely. "
+    "(2) Before answering questions about things said or shared outside the "
+    "recent window, call search_chat_history. "
+    "(3) The chat_id is supplied by the system; use the value provided and "
+    "never guess it. "
+    "(4) Humour rules: jokes and roasts must punch at behaviour visible in "
+    "the chat (always-late, spams stickers, ghosts the group), never at "
+    "appearance, identity, or anything genuinely hurtful. Only roast someone "
+    "when explicitly asked to. "
+    "(5) Keep replies chat-sized: a few sentences for casual questions, "
+    "short structured lists only when genuinely needed."
 )
 
 
@@ -71,15 +85,25 @@ def build_system_prompt(
     ctx: repository.ProjectContext,
     recent: list[repository.RecentMessage],
     memory: list[repository.RecentMessage] | None = None,
+    participants: list[str] | None = None,
+    roster: list[tuple[str, str | None]] | None = None,
 ) -> str:
-    """Assemble the system prompt (§3.2) with short-term conversation memory."""
-    members_lines = (
-        "\n".join(
-            f"- {m.display_name} (@{m.telegram_username or 'no_username'}) — {m.role}"
-            for m in ctx.members
-        )
-        or "- (no members verified yet)"
-    )
+    """Assemble the system prompt with roster, clock and short-term memory."""
+    # Manual roster first (name → handle, admin-curated), then anyone else
+    # spotted chatting who isn't already covered by a roster entry.
+    roster = roster or []
+    roster_lines = [
+        f"- {name}" + (f" (@{handle})" if handle else "") for name, handle in roster
+    ]
+    known = {name.lower() for name, _ in roster} | {
+        (handle or "").lower() for _, handle in roster
+    }
+    extra = [p for p in (participants or []) if p.lower() not in known]
+    people_lines = "\n".join(roster_lines) or "- (no members added yet)"
+    if extra:
+        people_lines += "\nAlso seen chatting (not in the member list): " + ", ".join(extra)
+    if not roster_lines and not extra:
+        people_lines = "- (nobody has chatted yet)"
 
     recent_lines = (
         "\n".join(f"[{r.telegram_message_id}] {r.sender}: {r.text}" for r in recent)
@@ -87,27 +111,30 @@ def build_system_prompt(
     )
 
     # SHORT-TERM MEMORY — the last few turns, so the agent remembers prior
-    # questions/answers and stays consistent across the conversation (Req 2).
+    # questions/answers and stays consistent across the conversation.
     memory_lines = (
         "\n".join(f"{m.sender}: {m.text}" for m in (memory or []))
         or "(no prior turns)"
     )
 
-    # Mode persona (Multi-Mode Group Agent) — shifts tone per group mode.
+    # Mode persona — shifts tone per group mode.
     from app.bot.modes import persona_for
 
     persona = persona_for(ctx.group_mode)
     persona_block = f"{persona}\n\n" if persona else ""
 
+    now_sg = datetime.now(timezone.utc).astimezone(_SGT)
+
     return (
         f"{_ROLE}\n\n"
         f"{persona_block}"
-        f"PROJECT CONTEXT\n"
-        f"Name: {ctx.name}\n"
-        f"Module: {ctx.module_code or 'N/A'}\n"
+        f"GROUP CONTEXT\n"
+        f"Group name: {ctx.name}\n"
         f"chat_id: {ctx.chat_id}\n"
-        f"Status: {ctx.status}\n\n"
-        f"PROJECT MEMBERS\n{members_lines}\n\n"
+        f"Current date/time: {now_sg.strftime('%A, %d %B %Y, %H:%M')} Singapore "
+        f"time (UTC+8) — use this for countdowns and anything time-relative.\n\n"
+        f"PEOPLE IN THIS CHAT (member list is admin-curated — when someone "
+        f"refers to a person by name, match them via this list)\n{people_lines}\n\n"
         f"SHORT-TERM MEMORY (most recent turns — use to stay consistent with the "
         f"ongoing conversation)\n{memory_lines}\n\n"
         f"RECENT MESSAGES (oldest first)\n{recent_lines}\n\n"
@@ -128,19 +155,22 @@ def _signature(name: str, raw_args: str) -> str:
     return f"{name}:{normalized}"
 
 
-async def _run_loop(chat_id: int, messages: list[dict[str, Any]]) -> str:
+async def _run_loop(
+    chat_id: int, messages: list[dict[str, Any]], *, mode: str | None = None
+) -> str:
     client = get_agnes_client()
     model = get_ai_settings().chat_model
     seen_signatures: set[str] = set()
+    toolset = tools.tools_for_mode(mode)
 
     for iteration in range(1, AGENT_MAX_ITERATIONS + 1):
         response = await logged_chat(
             client,
             model=model,
             messages=messages,
-            tools=tools.TOOLS,
+            tools=toolset,
             tool_choice="auto",
-            temperature=0.2,
+            temperature=0.4,
             chat_id=chat_id,
         )
         choice = response.choices[0]
@@ -257,13 +287,18 @@ async def run_agent(
     """
     ctx = await repository.load_project_context(chat_id)
     if ctx is None:
-        return "⚠️ This group isn't registered yet. Send /start to set up Student Claw."
+        return "⚠️ This group isn't registered yet. Send /start to wake me up."
 
     recent = await repository.load_recent_messages(chat_id, RECENT_MESSAGE_WINDOW)
     memory = recent[-MEMORY_TURNS:] if recent else []
+    participants = await repository.load_chat_participants(chat_id)
+    roster = await repository.load_group_roster(chat_id)
 
     base_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(ctx, recent, memory)}
+        {
+            "role": "system",
+            "content": build_system_prompt(ctx, recent, memory, participants, roster),
+        }
     ]
     if system_directive:
         base_messages.append({"role": "system", "content": system_directive})
@@ -275,7 +310,8 @@ async def run_agent(
     # clean base_messages survive for the fallback.
     try:
         return await asyncio.wait_for(
-            _run_loop(chat_id, list(base_messages)), timeout=AGENT_TIMEOUT_SECONDS
+            _run_loop(chat_id, list(base_messages), mode=ctx.group_mode),
+            timeout=AGENT_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         logger.warning("Agent timed out (%ss) for chat_id=%s; trying fallback.", AGENT_TIMEOUT_SECONDS, chat_id)

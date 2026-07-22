@@ -152,7 +152,8 @@ async def _resolve_text_and_chunks(
 
     if ctype == "text":
         text = parser.normalize_text(msg.raw_text)
-        if not text:
+        # Trivially short messages ("ok", "lol") are pure index noise.
+        if not text or len(text) < 12:
             return None
         # Live per-message ingestion: a single chat message → one chunk.
         # (Sliding-window conversational chunking is used by reindex_chat.)
@@ -227,6 +228,8 @@ async def vectorize_message(message_log_id: str) -> int:
 
     prepared = await _resolve_text_and_chunks(msg)
     if prepared is None or not prepared.chunks:
+        # Mark as done with zero points so /sync doesn't re-queue it forever.
+        await repository.mark_vectorized(msg.id, msg.project_id, [])
         logger.info("vectorize_message: nothing to embed for %s.", message_log_id)
         return 0
 
@@ -367,14 +370,18 @@ async def semantic_search(
     response = await client.query_points(
         collection_name=name,
         query=query_vec,
-        limit=max(top_k * 2, top_k),  # over-fetch to survive dedup
+        limit=max(top_k * 3, top_k),  # over-fetch to survive dedup + score filter
         query_filter=query_filter,
         with_payload=True,
     )
     hits = response.points
 
+    from app.ai.config import SEARCH_MIN_SCORE
+
     best: dict[str, SearchResult] = {}
     for h in hits:
+        if h.score is not None and h.score < SEARCH_MIN_SCORE:
+            continue  # noise floor — irrelevant hits mislead the agent
         payload = h.payload or {}
         mlid = str(payload.get("message_log_id", h.id))
         existing = best.get(mlid)

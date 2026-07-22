@@ -105,6 +105,84 @@ async def get_allowed_models(chat_id: int) -> dict:
     return dict(models or {})
 
 
+async def load_group_roster(chat_id: int) -> list[tuple[str, Optional[str]]]:
+    """
+    Manually added members (Settings → Members) as (display_name, handle)
+    pairs. This replaces the legacy web-app registration flow.
+    """
+    from app.database.models import GroupMember
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(GroupMember.display_name, GroupMember.telegram_username)
+                .join(Project, Project.id == GroupMember.project_id)
+                .where(Project.chat_id == chat_id)
+                .order_by(GroupMember.display_name.asc())
+            )
+        ).all()
+    return [(name, handle) for name, handle in rows]
+
+
+async def load_chat_participants(chat_id: int, limit: int = 400) -> list[str]:
+    """
+    Distinct sender names seen in the chat's recent history (newest first).
+    This is the real roster of a friend group — nobody has to 'verify' via the
+    legacy web dashboard for Agnes to know who's in the chat.
+    """
+    async with session_scope() as session:
+        rows = (
+            await session.scalars(
+                select(MessageLog.sender_telegram_username)
+                .where(
+                    MessageLog.chat_id == chat_id,
+                    MessageLog.deleted_at.is_(None),
+                    MessageLog.sender_telegram_username.is_not(None),
+                )
+                .order_by(desc(MessageLog.received_at))
+                .limit(limit)
+            )
+        ).all()
+    seen: list[str] = []
+    for name in rows:
+        if name and name != "Agnes" and name not in seen:
+            seen.append(name)
+    return seen
+
+
+@dataclass
+class UpcomingDate:
+    title: str
+    due_date: datetime
+
+
+async def list_upcoming_dates(
+    chat_id: int, *, include_past: bool = False
+) -> Optional[list[UpcomingDate]]:
+    """
+    Saved exams/deadlines for a chat, earliest first. Returns None when the
+    chat isn't registered. By default past dates are dropped.
+    """
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return None
+        rows = (
+            await session.scalars(
+                select(Deadline)
+                .where(Deadline.project_id == project.id)
+                .order_by(Deadline.due_date.asc())
+            )
+        ).all()
+    now = datetime.now(timezone.utc)
+    out = [
+        UpcomingDate(title=d.title, due_date=d.due_date)
+        for d in rows
+        if include_past or d.due_date >= now
+    ]
+    return out
+
+
 @dataclass
 class RecentMessage:
     sender: str

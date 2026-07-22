@@ -27,10 +27,14 @@ AGENT_MAX_ITERATIONS = 5
 AGENT_TIMEOUT_SECONDS = 30
 
 # How many recent text logs to inject into the system prompt window (§3.2).
-RECENT_MESSAGE_WINDOW = 30
+RECENT_MESSAGE_WINDOW = 40
 
 # Short-term memory: number of most recent turns injected as conversation memory.
-MEMORY_TURNS = 5
+MEMORY_TURNS = 8
+
+# Semantic search: drop hits below this cosine score — low-score matches are
+# noise that misleads the agent more than it helps.
+SEARCH_MIN_SCORE = float(os.getenv("SEARCH_MIN_SCORE", "0.25"))
 
 # Chunking constants (§2.4).
 PDF_CHUNK_TOKENS = 512

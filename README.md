@@ -1,24 +1,44 @@
-# Student Claw
+# Agnes — your group chat's AI companion
 
-AI project-management for student teams. A Telegram bot (Agnes AI) passively
-tracks a group chat — extracting deadlines, delegating tasks, scoring
-contributions, and answering questions over the project's history via RAG — and
-a Next.js web dashboard surfaces it all in a Kanban board, deadline timeline,
-contribution charts, and a chat-style "Ask Agnes" panel.
+Agnes is a Telegram bot that lives in a group chat with your friends and is
+actually fun *and* useful. She remembers everything shared in the chat
+(messages, photos, PDFs — all OCR'd and indexed for semantic recall) and turns
+it into features people use daily:
+
+| Command | What it does |
+|---|---|
+| 🧾 `/splitbill` | Reply to a **receipt photo** — Agnes OCRs the items, everyone taps what they ordered (shared dishes split automatically), service charge + GST are split **proportionally to what you ate**, and the payer's **PayNow number + QR code** is posted with the breakdown. |
+| 💳 `/paynow <mobile>` | Save your PayNow so bill splits point friends at it. |
+| 📋 `/summary` | Catch-up recap of the chat: topics, plans made, things needing your reply, one funny highlight. |
+| 📰 `/news [sg\|world\|tech\|sport\|business]` | Live headlines from public RSS feeds, summarised by Agnes with opinions. |
+| 😂 `/joke [topic]` | Original AI-generated humour, tuned to the group's running jokes (no lame programming jokes). |
+| 🔥 `/roast <name>` | A playful roast grounded in the target's actual chat behaviour — receipts included, feelings intact. |
+| 📚 `/exams` | Saved exam/deadline dates **with timings and countdowns** (SGT). Add naturally: `/exams add Linear Algebra final, 12 Aug 9–11am`. |
+| 💬 `/ask <anything>` | General questions — or just **@mention Agnes / reply to her** in chat. |
+| 💸 `/add_expense`, `/settle_up` | Quick shared-expense ledger with who-pays-whom. |
+
+Group modes (picked at `/init`) tune her persona: Friends/Chill, Bills &
+Makan, Study & Exams, Trips & Events, and a **legacy Projects mode** that keeps
+the old task-delegation tooling.
 
 ```
 Telegram group ──► Bot (python-telegram-bot)
                         │
                         ▼
-              FastAPI backend ──► Agnes AI (chat + embeddings)
+              FastAPI backend ──► Agnes AI (chat) + fastembed (local vectors)
               │   │   │   │
-   PostgreSQL ┘   │   │   └─ MinIO (files)        Next.js web app ──► Google
-   Qdrant (vectors)   └─ Redis (queue + pub/sub)   (BFF + dashboard)     Calendar
+   PostgreSQL ┘   │   │   └─ MinIO (files)
+   Qdrant (vectors)   └─ Redis (queue + pub/sub)
 ```
 
-Image and scanned-PDF OCR is handled by **Qwen 2.5 VL 72B** via the
-[OpenRouter](https://openrouter.ai) API — no local Tesseract installation
-required.
+Image, receipt and scanned-PDF OCR is handled by **Qwen 2.5 VL 72B** via the
+[OpenRouter](https://openrouter.ai) API (with Agnes vision as fallback) — no
+local Tesseract installation required.
+
+> **Legacy web dashboard** — this repo also contains the original "Student
+> Claw" Next.js project-management dashboard (`student-claw/frontend/` plus the
+> `/verify` linking flow). It is no longer part of the core experience but is
+> kept working for hackathon demos; see §7 and the legacy notes below.
 
 ---
 
@@ -43,17 +63,14 @@ student-claw/
 ├── backend/            FastAPI + Telegram bot + AI/RAG pipeline (Python)
 │   ├── app/
 │   │   ├── database/   SQLAlchemy models, connection, init
-│   │   ├── bot/        Telegram handlers, webhook, services
-│   │   ├── ai/         Parsing, embeddings, agent, calendar, pipeline
-│   │   ├── api/        FastAPI routers, schemas, deps
+│   │   ├── bot/        Telegram handlers, billsplit, news, services
+│   │   ├── ai/         Parsing/OCR, embeddings, agent, pipeline
+│   │   ├── api/        FastAPI routers (legacy dashboard API)
 │   │   └── core/       Auth, security, config
 │   ├── main.py         FastAPI entrypoint
 │   ├── requirements.txt
 │   └── .env.example
-├── frontend/           Next.js App Router (TypeScript)
-│   ├── src/
-│   ├── package.json
-│   └── .env.example
+├── frontend/           LEGACY Next.js dashboard (kept for hackathons)
 └── docker-compose.yml  Local infra (Postgres/Qdrant/Redis/MinIO)
 ```
 
@@ -175,7 +192,10 @@ cp .env.example .env
 
 ---
 
-## 7. Frontend setup
+## 7. Frontend setup (LEGACY — optional)
+
+The Next.js dashboard is a legacy feature; skip this section unless you want
+the old web app for a hackathon demo.
 
 ```bash
 cd student-claw/frontend
@@ -192,13 +212,41 @@ cp .env.example .env
 
 ---
 
-## 8. Run everything (local development)
-
-Open separate terminals (all from `student-claw/`):
+## 8. Run everything — ONE command 🎉
 
 ```bash
-# Terminal 1 — infra (if not already running)
-docker compose up -d
+cd student-claw
+docker compose up --build        # add -d to run detached
+```
+
+That single command builds the backend image and starts **seven services** in
+one terminal: Postgres, Qdrant, Redis, MinIO, plus the FastAPI **api** (with
+`init_db` run automatically — new tables just appear), the embedding
+**worker**, and the Telegram **bot** in polling mode. Requirements: Docker and
+a filled-in `backend/.env` (sections 3–4). No Python/uv/Node needed on the host.
+
+Useful follow-ups:
+
+```bash
+docker compose logs -f bot       # follow one service's logs (api / worker / bot)
+docker compose restart bot       # pick up backend code changes (api hot-reloads itself)
+docker compose down              # stop everything, keep data
+```
+
+Notes:
+- The backend source is bind-mounted, so the **api** hot-reloads on save;
+  restart `worker`/`bot` after editing their code.
+- First `worker` start downloads the ~100 MB fastembed model into a cached
+  volume (one-time).
+- The legacy Next.js dashboard is not in compose — run it manually with
+  `cd frontend && npm run dev` if you need it.
+
+<details>
+<summary><b>Alternative: native multi-terminal dev workflow</b> (fastest iteration)</summary>
+
+```bash
+# Terminal 1 — infra only
+docker compose up -d postgres qdrant redis minio
 
 # Terminal 2 — FastAPI web API            → http://localhost:8000  (docs: /docs)
 cd backend && .venv/bin/python -m uvicorn main:app --reload --port 8000
@@ -208,24 +256,26 @@ cd backend && .venv/bin/python -m app.ai.pipeline
 
 # Terminal 4 — Telegram bot (POLLING mode for local dev — no public URL needed)
 cd backend && .venv/bin/python -m app.bot.bot
-
-# Terminal 5 — Next.js dashboard          → http://localhost:3000
-cd frontend && npm run dev
 ```
+</details>
 
-> In local dev the bot runs in **polling** mode (Terminal 4) and FastAPI logs
-> that no `TELEGRAM_WEBHOOK_BASE_URL` is set — that's expected. In production you
-> instead set `TELEGRAM_WEBHOOK_BASE_URL` to your public HTTPS host and drop
-> Terminal 4; FastAPI registers the webhook and receives updates directly.
+> In local dev the bot runs in **polling** mode and FastAPI logs that no
+> `TELEGRAM_WEBHOOK_BASE_URL` is set — that's expected. In production you set
+> `TELEGRAM_WEBHOOK_BASE_URL` to your public HTTPS host and drop the bot
+> process; FastAPI registers the webhook and receives updates directly.
 
 ### First run — try it out
-1. Open `http://localhost:3000` and register an account (set your Telegram
-   username to match your real one).
-2. Add your bot to a Telegram **group** → it replies with a **Project Key**.
-3. In the dashboard, link the project with that key → it gives you a `/verify`
-   token → send `/verify <token>` in the group to link your account.
-4. Chat in the group, upload a PDF/PPTX/image, then ask the bot `/ask <question>`
-   or use the dashboard's **Ask Agnes** panel.
+1. Add your bot to a Telegram **group** → Agnes introduces herself.
+2. Run `/init` and pick the group's vibe (you become its admin).
+3. Save your PayNow: `/paynow 91234567`.
+4. Chat for a bit, then try `/summary`, `/news`, `/joke`, `/roast <friend>`.
+5. Post a receipt photo, reply to it with `/splitbill`, tap what you ordered,
+   hit **✅ Split it** — breakdown + PayNow QR appear.
+6. Share a PDF/image, run `/sync`, then `/ask` about its contents.
+
+> **Legacy dashboard flow:** register at `http://localhost:3000` with your
+> Telegram username, link the group via its Project Key, then `/verify <token>`
+> in the group. Only needed if you're using the old web app.
 
 ---
 

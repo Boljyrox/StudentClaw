@@ -23,6 +23,7 @@ from app.database.connection import session_scope
 from app.database.models import (
     ContentType,
     Expense,
+    GroupMember,
     LinkedVia,
     MemberRole,
     MessageLog,
@@ -479,6 +480,81 @@ async def toggle_allowed_model(chat_id: int, key: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Manual group roster (Settings → Members — replaces web-app registration)
+# ---------------------------------------------------------------------------
+async def list_group_members(chat_id: int) -> Optional[list[dict]]:
+    """Manually added members, or None if the chat isn't registered."""
+    async with session_scope() as session:
+        p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if p is None:
+            return None
+        rows = (
+            await session.scalars(
+                select(GroupMember)
+                .where(GroupMember.project_id == p.id)
+                .order_by(GroupMember.display_name.asc())
+            )
+        ).all()
+    return [
+        {
+            "id": str(m.id),
+            "display_name": m.display_name,
+            "telegram_username": m.telegram_username,
+        }
+        for m in rows
+    ]
+
+
+async def upsert_group_member(
+    chat_id: int, display_name: str, telegram_username: Optional[str], added_by: Optional[int]
+) -> bool:
+    """Add a member (or update their handle if the name already exists)."""
+    display_name = display_name.strip()[:100]
+    if not display_name:
+        return False
+    handle = (telegram_username or "").lstrip("@").strip()[:50] or None
+    async with session_scope() as session:
+        p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if p is None:
+            return False
+        existing = await session.scalar(
+            select(GroupMember).where(
+                GroupMember.project_id == p.id,
+                GroupMember.display_name.ilike(display_name),
+            )
+        )
+        if existing is not None:
+            existing.telegram_username = handle
+        else:
+            session.add(
+                GroupMember(
+                    project_id=p.id,
+                    display_name=display_name,
+                    telegram_username=handle,
+                    added_by_user_id=added_by,
+                )
+            )
+        return True
+
+
+async def remove_group_member(chat_id: int, member_id: str) -> bool:
+    try:
+        mid = uuid.UUID(member_id)
+    except ValueError:
+        return False
+    async with session_scope() as session:
+        member = await session.scalar(
+            select(GroupMember)
+            .join(Project, Project.id == GroupMember.project_id)
+            .where(Project.chat_id == chat_id, GroupMember.id == mid)
+        )
+        if member is None:
+            return False
+        await session.delete(member)
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Mode C — Expense Tracker
 # ---------------------------------------------------------------------------
 async def add_expense(
@@ -685,12 +761,16 @@ async def log_agent_interaction(
     answer: str,
     q_message_id: int,
     a_message_id: int,
+    include_question: bool = True,
 ) -> None:
     """
     Persist an agent Q&A turn into message_logs so it becomes part of the
-    short-term memory window (Requirement 2). Slash-command questions are
-    otherwise dropped (commands aren't captured by the passive listener), which
-    is why the agent "forgot" previous questions. NOT enqueued for embedding.
+    short-term memory window. Slash-command questions are otherwise dropped
+    (commands aren't captured by the passive listener), which is why the agent
+    used to "forget" previous questions. NOT enqueued for embedding.
+
+    include_question=False skips the question row — used when the passive
+    listener already logged it (e.g. @mention questions).
     """
     now = datetime.now(timezone.utc)
     async with session_scope() as session:
@@ -700,21 +780,21 @@ async def log_agent_interaction(
         if project is None:
             return
 
-        # User question.
-        session.add(
-            MessageLog(
-                id=uuid.uuid4(),
-                chat_id=chat_id,
-                project_id=project.id,
-                telegram_message_id=q_message_id,
-                sender_telegram_username=asker_username,
-                sender_telegram_user_id=asker_user_id,
-                content_type=ContentType.text,
-                raw_text=question,
-                is_vectorized=False,
-                received_at=now,
+        if include_question:
+            session.add(
+                MessageLog(
+                    id=uuid.uuid4(),
+                    chat_id=chat_id,
+                    project_id=project.id,
+                    telegram_message_id=q_message_id,
+                    sender_telegram_username=asker_username,
+                    sender_telegram_user_id=asker_user_id,
+                    content_type=ContentType.text,
+                    raw_text=question,
+                    is_vectorized=False,
+                    received_at=now,
+                )
             )
-        )
         # Agnes answer (plain text; HTML stripped for memory readability).
         session.add(
             MessageLog(

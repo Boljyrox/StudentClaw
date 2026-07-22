@@ -1,13 +1,63 @@
 # ============================================================================
-#  Student Claw — local infrastructure services
-#  Brings up PostgreSQL, Qdrant, Redis, and MinIO for development.
+#  Agnes — full local stack (infra + app) in ONE command.
 #
-#  Usage:  docker compose up -d        (start)
-#          docker compose down         (stop, keep data)
-#          docker compose down -v       (stop, wipe data)
+#  Usage:  docker compose up --build      (start everything, one terminal)
+#          docker compose up -d           (same, detached)
+#          docker compose logs -f bot     (follow one service's logs)
+#          docker compose down            (stop, keep data)
+#          docker compose down -v         (stop, wipe data)
+#
+#  Infra-only (for the native multi-terminal dev workflow):
+#          docker compose up -d postgres qdrant redis minio
+#
+#  App services (api / worker / bot) share one image built from ./backend and
+#  read secrets from ./backend/.env; the host URLs below override the
+#  localhost values in .env so the same file works natively AND in Docker.
 # ============================================================================
 
+x-backend: &backend
+  build: ./backend
+  env_file: ./backend/.env
+  environment: &backend-env
+    DATABASE_URL: postgresql+asyncpg://student_claw:student_claw@postgres:5432/student_claw
+    QDRANT_URL: http://qdrant:6333
+    REDIS_URL: redis://redis:6379/0
+    MINIO_ENDPOINT: minio:9000
+    HF_HOME: /models        # fastembed model cache (downloaded once)
+  volumes:
+    - ./backend/app:/app/app        # live code — API hot-reloads, others restart fast
+    - ./backend/main.py:/app/main.py
+    - fastembed_cache:/models
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_started
+    qdrant:
+      condition: service_started
+    minio:
+      condition: service_started
+  restart: on-failure
+
 services:
+  # ── App ───────────────────────────────────────────────────────────────────
+  api:
+    <<: *backend
+    # init_db is idempotent (create_all) — new tables appear automatically.
+    command: sh -c "python -m app.database.init_db && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    ports:
+      - "8000:8000"
+
+  worker:
+    <<: *backend
+    command: python -m app.ai.pipeline
+
+  bot:
+    <<: *backend
+    # Long-polling — exactly one instance (Telegram allows a single poller).
+    command: python -m app.bot.bot
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
   postgres:
     image: postgres:16
     environment:
@@ -57,3 +107,4 @@ volumes:
   qdrantdata:
   redisdata:
   miniodata:
+  fastembed_cache:
