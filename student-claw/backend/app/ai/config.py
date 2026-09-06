@@ -32,6 +32,12 @@ RECENT_MESSAGE_WINDOW = 40
 # Short-term memory: number of most recent turns injected as conversation memory.
 MEMORY_TURNS = 8
 
+# Long-term group memory: discrete facts Agnes has been told to remember.
+# Anything older than this is pruned automatically (one month, per product spec).
+MEMORY_RETENTION_DAYS = int(os.getenv("MEMORY_RETENTION_DAYS", "30"))
+# Ceiling on how many memories get injected into the prompt.
+MEMORY_PROMPT_LIMIT = 40
+
 # Semantic search: drop hits below this cosine score — low-score matches are
 # noise that misleads the agent more than it helps.
 SEARCH_MIN_SCORE = float(os.getenv("SEARCH_MIN_SCORE", "0.25"))
@@ -67,10 +73,27 @@ class AISettings:
     # Embedding provider: "fastembed" (local, default) or "agnes".
     embed_provider: str
     fastembed_model: str
-    # OpenRouter fallback (Requirement 2) + Qwen VLM OCR.
+    # OpenRouter. THREE distinct roles — do not collapse them into one var:
+    #   openrouter_model            cheap text model for the chat fallback
+    #   openrouter_reasoning_model  stronger text model for complex requests
+    #   openrouter_vision_model     multimodal model for receipt/document OCR
+    # These were previously all one setting, which meant ordinary text replies
+    # were being answered by a large (expensive) vision model.
     openrouter_api_key: str
     openrouter_base_url: str
     openrouter_model: str
+    openrouter_reasoning_model: str
+    openrouter_vision_model: str
+
+
+@dataclass(frozen=True)
+class OneMapSettings:
+    """OneMap SG — geocoding is public; routing needs a token."""
+
+    base_url: str
+    token: str
+    email: str
+    password: str
 
 
 @dataclass(frozen=True)
@@ -116,7 +139,27 @@ def get_ai_settings() -> AISettings:
         fastembed_model=fastembed_model,
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
         openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        openrouter_model=os.getenv("OPENROUTER_MODEL", "google/gemini-3.5-flash"),
+        # Cheap, fast text model — the everyday fallback when Agnes is down.
+        openrouter_model=os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash"),
+        # Stronger text model, used only for requests the router deems complex.
+        openrouter_reasoning_model=os.getenv(
+            "OPENROUTER_REASONING_MODEL", "deepseek/deepseek-v3.2"
+        ),
+        # Multimodal model for receipt photos and scanned PDFs. MUST support
+        # image input — DeepSeek text models do not.
+        openrouter_vision_model=os.getenv(
+            "OPENROUTER_VISION_MODEL", "qwen/qwen3-vl-32b-instruct"
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_onemap_settings() -> OneMapSettings:
+    return OneMapSettings(
+        base_url=os.getenv("ONEMAP_BASE_URL", "https://www.onemap.gov.sg"),
+        token=os.getenv("ONEMAP_TOKEN", ""),
+        email=os.getenv("ONEMAP_EMAIL", ""),
+        password=os.getenv("ONEMAP_PASSWORD", ""),
     )
 
 

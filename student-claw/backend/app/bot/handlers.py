@@ -42,9 +42,19 @@ from telegram.ext import (
     filters,
 )
 
-from app.ai import pipeline, queue, repository, storage
+from app.ai import pipeline, queue, repository, routing, storage
 from app.ai.agent import run_agent
-from app.bot import billsplit, events, modes, news, services
+from app.bot import (
+    billsplit,
+    events,
+    expenses,
+    meetpoint,
+    memory_ui,
+    modes,
+    news,
+    services,
+    settle,
+)
 from app.bot.config import MAX_FILE_SIZE_BYTES
 from app.database.models import ContentType, ProjectStatus
 
@@ -63,7 +73,7 @@ _MIN_EMBED_TEXT_CHARS = 12
 PRIVACY_NOTICE = (
     "ℹ️ I remember this group's messages and files so I can recap chats, "
     "answer questions and split bills. An admin can wipe my memory anytime "
-    "from the /sc menu."
+    "from the /mainmenu menu."
 )
 
 
@@ -77,7 +87,10 @@ def _welcome_text() -> str:
         "😂 <b>/joke</b> &amp; 🔥 <b>/roast</b> — entertainment on demand\n"
         "📋 <b>/summary</b> — catch up on what you missed\n"
         "📚 <b>/exams</b> — I remember your exam dates and timings\n"
+        "📍 <b>/meetpoint</b> — somewhere fair to meet, with everyone's "
+        "own directions\n"
         "💬 <b>/ask</b> anything — or just @mention me\n\n"
+        "<b>/commands</b> for the full list · <b>/mainmenu</b> for settings\n\n"
         f"{PRIVACY_NOTICE}"
     )
 
@@ -96,7 +109,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         if result.created:
             await update.effective_message.reply_text(
-                "👉 Run /init to pick this group's vibe and become its admin."
+                "👉 Run /init to become this group's admin, then /mainmenu to look around."
             )
     else:
         await update.effective_message.reply_text(
@@ -114,12 +127,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "😂 /joke [topic] — an actually funny joke\n"
         "🔥 /roast &lt;name&gt; — playful roast, powered by chat receipts\n"
         "📚 /exams — upcoming exams &amp; deadlines (add: /exams add Math final 12 Aug 9am)\n\n"
-        "🧾 <b>Bill splitting</b>\n"
+        "🧾 <b>Money</b>\n"
         "/splitbill — reply to a receipt photo; tap items to claim them\n"
+        "/splitexpense — no receipt? e.g. <code>/splitexpense i paid $20 for "
+        "the photo booth with raja and madhu</code>\n"
+        "/settle_up — all pending expenses; mark and confirm payments\n"
         "/bill — reopen the current bill's claim board\n"
-        "/paynow &lt;mobile&gt; — save your PayNow so friends can pay you\n"
-        "/add_expense 15 pizza · /list_expenses · /settle_up — quick ledger\n\n"
-        "⚙️ /sc — full menu (sync files, mode, admin, memory)\n"
+        "/paynow &lt;mobile&gt; — save your PayNow so friends can pay you\n\n"
+        "⚙️ /mainmenu — full menu (memory, names, admin)\n"
         "🕶 Legacy: /verify links the old web dashboard (hackathon feature)",
         parse_mode="HTML",
     )
@@ -150,8 +165,8 @@ async def _register_and_welcome(chat: Chat, context: ContextTypes.DEFAULT_TYPE) 
             "Registered new project %s for chat_id=%s (%s)",
             result.project_id, chat.id, result.name,
         )
-        # New groups start uninitialised — scope their menu to just /init.
-        await modes.apply_chat_commands(context.bot, chat.id, "uninitialized")
+    # Publish the command menu for this chat (same list for every group).
+    await modes.apply_chat_commands(context.bot, chat.id)
     try:
         await context.bot.send_message(
             chat_id=chat.id,
@@ -161,7 +176,7 @@ async def _register_and_welcome(chat: Chat, context: ContextTypes.DEFAULT_TYPE) 
         if result.created:
             await context.bot.send_message(
                 chat_id=chat.id,
-                text="👉 Run /init to pick this group's vibe and become its admin.",
+                text="👉 Run /init to become this group's admin, then /mainmenu to look around.",
             )
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Could not send welcome message to %s: %s", chat.id, exc)
@@ -333,8 +348,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if msg is None:
         return
 
-    # Consume a pending /sc free-text input (Set Goals / Set Details) — the user
-    # replying to our ForceReply prompt. Not ingested into RAG.
+    # Feature-owned free-text prompts (meetpoint location / activity, memory
+    # edits) and the meet-point "reply with a number" confirmation. Each hook
+    # returns True once it has consumed the message, so it never reaches RAG.
+    if await meetpoint.maybe_handle_text(update, context):
+        return
+    if await meetpoint.maybe_handle_number_reply(update, context):
+        return
+    if await memory_ui.maybe_handle_text(update, context):
+        return
+    if await expenses.maybe_handle_text(update, context):
+        return
+
+    # Consume a pending /mainmenu free-text input — the user replying to our
+    # ForceReply prompt. Not ingested into RAG.
     awaiting = context.chat_data.get("sc_await")
     if (
         awaiting
@@ -354,41 +381,36 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         elif awaiting["action"] == "details":
             ok = await services.update_project_details(chat.id, value)
             await msg.reply_text("✏️ Group name updated." if ok else "⚠️ Couldn't update.")
-        elif awaiting["action"] == "member_add":
-            # "Bala @balaji05" / "@balaji05 Bala" / "Bala" — the @token (if
-            # any) is the handle, the rest is the display name.
-            tokens = value.split()
-            handle = next((t for t in tokens if t.startswith("@")), None)
-            name = " ".join(t for t in tokens if not t.startswith("@")).strip()
-            if not name and handle:
-                name = handle.lstrip("@")
-            ok = bool(name) and await services.upsert_group_member(
-                chat.id, name, handle, sender.id if sender else None
+        elif awaiting["action"] == "names_bulk":
+            # One-shot roster: a pasted block of "Name @handle" lines replaces
+            # the whole member list.
+            entries, rejected = services.parse_roster_block(value)
+            if not entries:
+                await msg.reply_text(
+                    "⚠️ I couldn't read any names there. One per line, like:\n"
+                    "<code>Bala @balaji05</code>",
+                    parse_mode="HTML",
+                )
+                return
+            count = await services.replace_group_members(
+                chat.id, entries, sender.id if sender else None
             )
-            if ok:
-                label = name + (f" ({handle})" if handle else "")
-                await msg.reply_text(f"👥 Added <b>{_md_escape_min(label)}</b>.", parse_mode="HTML")
-            else:
-                await msg.reply_text("⚠️ Couldn't add that. Format: Name @handle")
+            listing = "\n".join(
+                f"• {_md_escape_min(n)}" + (f" — @{_md_escape_min(h)}" if h else "")
+                for n, h in entries
+            )
+            note = (
+                "\n\n<i>Skipped: " + ", ".join(_md_escape_min(r) for r in rejected[:5]) + "</i>"
+                if rejected
+                else ""
+            )
+            await msg.reply_text(
+                f"👥 <b>Saved {count} {'person' if count == 1 else 'people'}:</b>\n{listing}{note}",
+                parse_mode="HTML",
+            )
         return
 
     content_type, raw_text, file_mime_type = _classify_content(update)
-
-    # Expense-mode capture: parse "Ashok paid $15 for pizza" into the ledger.
-    if raw_text and content_type == ContentType.text:
-        m = _EXPENSE_RE.match(raw_text.strip())
-        if m:
-            state = await services.get_group_state(chat.id)
-            if state and state.group_mode == "expense":
-                payer = m.group(1).strip()
-                amount = float(m.group(2))
-                desc = (m.group(3) or "").strip()
-                await services.add_expense(chat.id, payer, None, amount, desc or None)
-                await msg.reply_text(
-                    f"💸 Logged: <b>{payer}</b> paid {_money(amount)}"
-                    + (f" for {desc}" if desc else ""),
-                    parse_mode="HTML",
-                )
 
     file_storage_path: str | None = None
     if content_type in (ContentType.image, ContentType.document):
@@ -551,6 +573,12 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not question:
         await msg.reply_text("Usage: /ask <anything> — or just @mention me in chat.")
         return
+
+    # "delete the memory about the DDW exam" is handled here rather than by the
+    # agent, so a deletion always goes through an explicit confirmation.
+    if memory_ui.looks_like_forget_request(question):
+        if await memory_ui.handle_forget_request(update, context, question):
+            return
 
     await _deferred_agent(update, context, user_message=question)
 
@@ -1049,44 +1077,39 @@ def _md_escape_min(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Multi-Mode: /init, mode selection, /admin_settings, Mode B & Mode C
+# Group setup: /init, /admin_settings
 # ---------------------------------------------------------------------------
-_EXPENSE_RE = re.compile(
-    r"^([A-Za-z][\w ]*?)\s+paid\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:for\s+|on\s+|-\s*)?(.*)$",
-    re.IGNORECASE,
-)
-
-
-def _mode_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = [[_btn(modes.MODE_LABELS[m], f"sc|mode|{m}")] for m in modes.MODE_ORDER]
-    return InlineKeyboardMarkup(rows)
-
-
 def _admin_settings_keyboard(allowed: dict) -> InlineKeyboardMarkup:
     def state(key: str) -> str:
         return "🟢 ON" if services.model_allowed(allowed, key) else "🔴 OFF"
 
-    return InlineKeyboardMarkup(
-        [
-            [_btn(f"Qwen-VL (image/PDF OCR): {state('qwen_vl')}", "sc|am|qwen_vl")],
-            [_btn(f"Gemini fallback: {state('gemini_fallback')}", "sc|am|gemini_fallback")],
-            _back(),
-        ]
-    )
-
-
-def _goals_editor_keyboard(lines: list[str]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for i, ln in enumerate(lines[:12]):
-        label = (ln[:40] + "…") if len(ln) > 40 else ln
-        rows.append([_btn(f"❌ {label}", f"sc|gedit|rm|{i}")])
-    rows.append([_btn("➕ Add goal", "sc|gedit|add"), _btn("🗑 Clear", "sc|gedit|clear")])
-    rows.append(_back("sc|set"))
+    current = routing.get_model_choice(allowed)
+    rows = [
+        [_btn(f"Qwen-VL (image/PDF OCR): {state('qwen_vl')}", "sc|am|qwen_vl")],
+        [_btn(f"Gemini fallback: {state('gemini_fallback')}", "sc|am|gemini_fallback")],
+    ]
+    # Model routing — radio-style, Auto by default.
+    for choice in routing.VALID_CHOICES:
+        tick = "🔘" if choice == current else "⚪️"
+        rows.append([_btn(f"{tick} {routing.CHOICE_LABELS[choice]}", f"sc|am|set|{choice}")])
+    rows.append(_back())
     return InlineKeyboardMarkup(rows)
 
 
+_AI_SETTINGS_TEXT = (
+    "🤖 <b>AI settings</b>\n\n"
+    "<b>Auto</b> keeps everyday chat on Agnes (free) and only reaches for "
+    "OpenRouter when a question actually needs deeper reasoning — long "
+    "problems, code, analysis, calculations.\n\n"
+    "Tap to change:"
+)
+
+
 async def init_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """First-time initialisation: claim admin + choose the group's mode."""
+    """
+    First-time setup: claim admin and switch everything on. There's nothing to
+    choose any more — every group gets every feature.
+    """
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
@@ -1098,12 +1121,17 @@ async def init_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     uid = update.effective_user.id if update.effective_user else None
     if state.group_admin_id is not None and state.group_admin_id != uid:
-        await msg.reply_text("🔒 This group is already initialised. Only its admin can re-initialise.")
+        await msg.reply_text("🔒 This group is already set up. Only its admin can re-run /init.")
         return
+
+    await services.initialise_group(chat.id, uid or 0, "default")
+    await modes.apply_chat_commands(context.bot, chat.id)
     await msg.reply_text(
-        "👋 <b>Welcome!</b> Pick what this group is for — you'll become its admin:",
+        "👋 <b>All set — you're the admin.</b>\n\n"
+        "I'm listening to this chat now. Everything's switched on: bills, "
+        "memory, meet-ups, exams, news, the lot.\n\n"
+        "Tap 📖 <b>Commands</b> in /mainmenu to see what I can do.",
         parse_mode="HTML",
-        reply_markup=_mode_menu_keyboard(),
     )
 
 
@@ -1122,7 +1150,7 @@ async def admin_settings_command(update: Update, context: ContextTypes.DEFAULT_T
         await msg.reply_text("🔒 Leaders only.")
         return
     await msg.reply_text(
-        "⚙️ <b>AI model settings</b> — tap to toggle:",
+        _AI_SETTINGS_TEXT,
         parse_mode="HTML",
         reply_markup=_admin_settings_keyboard(state.allowed_models),
     )
@@ -1145,89 +1173,6 @@ async def meme_prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ── Mode C: Expense Tracker ──
-def _money(v: float) -> str:
-    return f"${v:,.2f}"
-
-
-async def add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    msg = update.effective_message
-    user = update.effective_user
-    if not _is_group(chat):
-        await msg.reply_text("Use this inside your group chat.")
-        return
-    if not context.args:
-        await msg.reply_text("Usage: /add_expense <amount> <description>\ne.g. /add_expense 15 pizza")
-        return
-    try:
-        amount = float(context.args[0].lstrip("$"))
-    except ValueError:
-        await msg.reply_text("First argument must be an amount, e.g. /add_expense 15 pizza")
-        return
-    desc = " ".join(context.args[1:]).strip()
-    payer = (user.first_name if user else None) or (f"@{user.username}" if user and user.username else "Someone")
-    ok = await services.add_expense(chat.id, payer, user.id if user else None, amount, desc or None)
-    if not ok:
-        await msg.reply_text("⚠️ This group isn't registered yet.")
-        return
-    await msg.reply_text(
-        f"💸 Logged: <b>{payer}</b> paid {_money(amount)}" + (f" for {desc}" if desc else ""),
-        parse_mode="HTML",
-    )
-
-
-async def list_expenses_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not _is_group(chat):
-        await msg.reply_text("Use this inside your group chat.")
-        return
-    items = await services.list_expenses(chat.id, limit=20)
-    if items is None:
-        await msg.reply_text("⚠️ This group isn't registered yet.")
-        return
-    if not items:
-        await msg.reply_text("No expenses logged yet. Add one with /add_expense 15 pizza")
-        return
-    total = sum(i["amount"] for i in items)
-    lines = "\n".join(
-        f"• <b>{i['payer']}</b> {_money(i['amount'])}" + (f" — {i['description']}" if i["description"] else "")
-        for i in items
-    )
-    await msg.reply_text(
-        f"💸 <b>Recent expenses</b> (total {_money(total)})\n{lines}", parse_mode="HTML"
-    )
-
-
-async def settle_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not _is_group(chat):
-        await msg.reply_text("Use this inside your group chat.")
-        return
-    result = await services.compute_balances(chat.id)
-    if result is None:
-        await msg.reply_text("⚠️ This group isn't registered yet.")
-        return
-    if result["count"] == 0:
-        await msg.reply_text("No expenses to settle yet.")
-        return
-    bal_lines = "\n".join(
-        f"• {name}: {'+' if net >= 0 else ''}{_money(net)}" for name, net in result["balances"]
-    )
-    if result["settlements"]:
-        settle_lines = "\n".join(
-            f"➡️ <b>{d}</b> pays <b>{c}</b> {_money(a)}" for d, c, a in result["settlements"]
-        )
-    else:
-        settle_lines = "Everyone's square. 🎉"
-    await msg.reply_text(
-        f"🧾 <b>Settle up</b> (total {_money(result['total'])})\n\n"
-        f"<b>Balances</b>\n{bal_lines}\n\n<b>Who pays whom</b>\n{settle_lines}",
-        parse_mode="HTML",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Unified /sc inline menu + RBAC (app-like UX)
 # ---------------------------------------------------------------------------
@@ -1236,14 +1181,12 @@ _DENY = "🔒 Admins only. Ask the group admin."
 
 _SC_MENU_HELP = (
     "<b>Agnes menu</b>\n\n"
-    "• <b>Summary / News / Joke / Exams</b> — the daily drivers\n"
-    "• <b>Bill</b> — reopen the current bill (start one by replying to a "
-    "receipt photo with /splitbill)\n"
-    "• <b>Sync</b> — index all shared files (OCR + memory)\n"
-    "• <b>Set</b> — group mode, name, AI settings\n"
-    "• <b>Clear / Activation</b> — admins only\n\n"
-    "Outside the menu: <code>/ask &lt;anything&gt;</code>, "
-    "<code>/roast &lt;name&gt;</code>, or just @mention me."
+    "The menu is only for things that need buttons — everything else is a "
+    "slash command. Tap <b>📖 Commands</b> to see the full list.\n\n"
+    "• <b>🧠 Memory</b> — see, edit or delete what I remember\n"
+    "• <b>📖 Commands</b> — everything I can do\n"
+    "• <b>⚙️ Set</b> — tell me who's in the group\n"
+    "• <b>🤖 AI / Activation</b> — admins only"
 )
 _VERIFY_HELP = (
     "<b>Legacy: link the web dashboard</b>\n"
@@ -1264,63 +1207,29 @@ def _back(to: str = "sc|main") -> list[InlineKeyboardButton]:
 
 
 def _main_menu_keyboard(state: "services.GroupState", privileged: bool) -> InlineKeyboardMarkup:
+    """
+    Deliberately small. Everything that is just "run a thing" (summary, news,
+    joke, exams, bill, sync…) is a slash command — only genuinely interactive
+    settings live behind buttons.
+    """
     rows = [
-        [_btn("📋 Summary", "sc|summary"), _btn("📰 News", "sc|news")],
-        [_btn("😂 Joke", "sc|hehe"), _btn("📚 Exams", "sc|deadlines")],
-        [_btn("🧾 Bill", "sc|bill"), _btn("🔄 Sync", "sc|sync")],
+        [_btn("🧠 Memory", "sc|mem")],
+        [_btn("📖 Commands", "sc|cmds")],
+        [_btn("⚙️ Set", "sc|set")],
     ]
-    set_row = [_btn("⚙️ Set", "sc|set")]
-    if privileged:
-        set_row.append(_btn("🗑️ Clear memory", "sc|clear"))
-    rows.append(set_row)
-    last: list[InlineKeyboardButton] = []
     if privileged:
         dot = "🟢" if state.bot_active else "🔴"
-        last.append(_btn(f"{dot} Activation", "sc|act"))
-    last.append(_btn("❓ Help", "sc|help"))
-    rows.append(last)
+        rows.append([_btn(f"{dot} Activation", "sc|act"), _btn("🤖 AI", "sc|am")])
     return InlineKeyboardMarkup(rows)
 
 
 def _set_menu_keyboard(privileged: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    """Set holds one thing: telling Agnes who's in the group."""
+    rows = [[_btn("👥 Set names", "sc|set|names")]]
     if privileged:
-        rows.append([_btn("👥 Members", "sc|mem"), _btn("🔀 Set Mode", "sc|mode")])
-        rows.append([_btn("✏️ Set Group Name", "sc|set|details"), _btn("⚙️ AI Settings", "sc|am")])
-    else:
-        rows.append([_btn("👥 Members", "sc|mem")])
+        rows.append([_btn("✏️ Group name", "sc|set|details")])
     rows.append(_back())
     return InlineKeyboardMarkup(rows)
-
-
-def _members_keyboard(members: list[dict]) -> InlineKeyboardMarkup:
-    """Manual roster editor: tap a member to remove, ➕ to add."""
-    rows: list[list[InlineKeyboardButton]] = []
-    for m in members[:20]:
-        label = m["display_name"] + (
-            f" (@{m['telegram_username']})" if m["telegram_username"] else ""
-        )
-        rows.append([_btn(f"❌ {label[:48]}", f"sc|mem|rm|{m['id']}")])
-    rows.append([_btn("➕ Add member", "sc|mem|add")])
-    rows.append(_back("sc|set"))
-    return InlineKeyboardMarkup(rows)
-
-
-def _members_text(members: list[dict]) -> str:
-    if not members:
-        body = "<i>(no members added yet)</i>"
-    else:
-        body = "\n".join(
-            f"• <b>{_md_escape_min(m['display_name'])}</b>"
-            + (f" — @{_md_escape_min(m['telegram_username'])}" if m["telegram_username"] else "")
-            for m in members
-        )
-    return (
-        "👥 <b>Group members</b>\n"
-        "So I know exactly who you mean — for roasts, summaries, bills…\n\n"
-        f"{body}\n\n"
-        "Tap ❌ to remove, or ➕ to add someone (name + @handle)."
-    )
 
 
 def _activation_menu_keyboard() -> InlineKeyboardMarkup:
@@ -1332,23 +1241,13 @@ def _activation_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _roles_keyboard(members: list[dict]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for m in members:
-        name = m["display_name"]
-        sid = m["student_id"]
-        if m["role"] == "lead":
-            rows.append([_btn(f"👑 {name} (Leader) → Member", f"sc|role|{sid}|member")])
-        else:
-            rows.append([_btn(f"👤 {name} (Member) → Leader", f"sc|role|{sid}|lead")])
-    if not rows:
-        rows.append([_btn("(no verified members yet)", "sc|set|roles")])
-    rows.append(_back("sc|set"))
-    return InlineKeyboardMarkup(rows)
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Master command — opens the interactive menu.
 
-
-async def sc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Master command — opens the interactive menu."""
+    Canonical name is /mainmenu; "menu" and "sc" stay as hidden aliases so
+    older habits (and any pinned messages) keep working.
+    """
+    await _heal_command_scope(update, context)
     chat = update.effective_chat
     msg = update.effective_message
     if not _is_group(chat):
@@ -1363,6 +1262,33 @@ async def sc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await msg.reply_text(
         _SC_HEADER, parse_mode="HTML",
         reply_markup=_main_menu_keyboard(state, privileged),
+    )
+
+
+async def _heal_command_scope(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Clear this chat's stale command-scope override, once per chat per process.
+
+    Groups that ran an older build still carry a chat-scoped command list on
+    Telegram's servers, which shadows the global one. Existing groups would
+    otherwise keep seeing the old menu forever, since nothing re-triggers
+    /start for them. Cheap (one API call per chat per restart) and best-effort.
+    """
+    chat = update.effective_chat
+    if chat is None or context.chat_data.get("cmd_scope_healed"):
+        return
+    context.chat_data["cmd_scope_healed"] = True
+    await modes.apply_chat_commands(context.bot, chat.id)
+
+
+async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The full command list, same content as the menu's 📖 Commands screen."""
+    chat = update.effective_chat
+    uid = update.effective_user.id if update.effective_user else None
+    privileged = bool(chat) and await services.is_privileged_user(chat.id, uid)
+    await _heal_command_scope(update, context)
+    await update.effective_message.reply_text(
+        modes.command_catalogue_text(privileged), parse_mode="HTML"
     )
 
 
@@ -1404,9 +1330,13 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     uid = user.id if user else None
     privileged = await services.is_privileged_user(chat.id, uid)
 
-    # RBAC: gate sensitive actions even if a stale button is clicked.
+    # RBAC: gate sensitive actions even if a stale button is clicked. Memory is
+    # deliberately open to everyone — it's the group's shared memory — but
+    # wiping it, activation and model settings stay with admins.
+    destructive_memory = action == "mem" and sub in {"wipe", "wipeok", "nlbulk"}
     denied = (
-        (action in {"clear", "act", "role", "mode", "am", "mem"})
+        action in {"clear", "act", "role", "am"}
+        or destructive_memory
         or (action == "set" and sub in {"details", "roles"})
     )
     if denied and not privileged:
@@ -1438,6 +1368,13 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # ── Info screens ──
+    if action == "cmds":
+        await query.answer()
+        await query.edit_message_text(
+            modes.command_catalogue_text(privileged), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([_back()]),
+        )
+        return
     if action == "help":
         await query.answer()
         await query.edit_message_text(
@@ -1453,29 +1390,8 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ── Leaf actions reusing existing command logic (new message below the menu) ──
-    if action == "summary":
-        await query.answer("Summarising…"); await summary_command(update, context); return
-    if action == "news":
-        await query.answer("📰"); await news.news_command(update, context); return
-    if action == "hehe":
-        await query.answer("😂"); await joke_command(update, context); return
-    if action == "deadlines":
-        await query.answer("📚"); await exams_command(update, context); return
-    if action == "bill":
-        await query.answer("🧾"); await billsplit.bill_command(update, context); return
-    if action == "sync":
-        await query.answer("Syncing…"); await sync_command(update, context); return
-    if action == "celebrate":  # legacy button
-        await query.answer("🎉"); await celebrate_command(update, context); return
-    if action == "assign":  # legacy button (projects mode)
-        await query.answer("Assigning…")
-        await _deferred_agent(
-            update, context,
-            user_message="Assign the outstanding work to the team.",
-            system_directive=_ASSIGN_WORK_DIRECTIVE,
-        )
-        return
+    # Everyday actions are slash commands now, not buttons — the only leaf left
+    # is the legacy cache wipe, which still needs its confirmation step.
     if action == "clear":
         await query.answer(); await clear_command(update, context); return  # renders clr: confirm
 
@@ -1497,126 +1413,61 @@ async def on_sc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # ── Mode selection (claim admin + scope commands) ──
-    if action == "mode" and sub is None:
-        await query.answer()
-        await query.edit_message_text(
-            "🔀 <b>Choose a mode</b> for this group:", parse_mode="HTML",
-            reply_markup=_mode_menu_keyboard(),
-        )
-        return
-    if action == "mode" and sub:
-        ok = await services.initialise_group(chat.id, uid or 0, sub)
-        if ok:
-            await modes.apply_chat_commands(context.bot, chat.id, sub)
-        await query.answer("Mode set ✅" if ok else "Failed.", show_alert=not ok)
-        label = modes.MODE_LABELS.get(sub, sub)
-        await query.edit_message_text(
-            f"✅ This group is now in <b>{label}</b> mode. The command menu has been updated.",
-            parse_mode="HTML",
-        )
-        return
-
-    # ── Members (manual roster — replaces web-app registration) ──
+    # ── Memory (view / edit / delete what Agnes remembers) ──
     if action == "mem":
-        if sub == "add":
-            await query.answer()
-            await _prompt_input(
-                update, context, "member_add",
-                "➕ Reply to this with the member's <b>name and @handle</b>, "
-                "e.g. <code>Bala @balaji05</code> (handle optional):",
-            )
-            return
-        if sub == "rm" and len(parts) >= 4:
-            await services.remove_group_member(chat.id, parts[3])
-            await query.answer("Removed")
-        else:
-            await query.answer()
-        members = await services.list_group_members(chat.id) or []
-        await query.edit_message_text(
-            _members_text(members), parse_mode="HTML",
-            reply_markup=_members_keyboard(members),
-        )
+        await memory_ui.handle_callback(update, context, parts)
         return
 
-    # ── Admin settings (AI model toggles) ──
+    # ── AI settings (model toggles + routing choice) ──
     if action == "am" and sub is None:
         await query.answer()
         await query.edit_message_text(
-            "⚙️ <b>AI model settings</b> — tap to toggle:", parse_mode="HTML",
+            _AI_SETTINGS_TEXT, parse_mode="HTML",
             reply_markup=_admin_settings_keyboard(state.allowed_models),
         )
         return
-    if action == "am" and sub:
-        models = await services.toggle_allowed_model(chat.id, sub)
+    if action == "am" and sub == "set" and len(parts) >= 4:
+        allowed = await services.set_model_choice(chat.id, parts[3])
         await query.answer("Updated ✅")
         await query.edit_message_text(
-            "⚙️ <b>AI model settings</b> — tap to toggle:", parse_mode="HTML",
-            reply_markup=_admin_settings_keyboard(models or {}),
+            _AI_SETTINGS_TEXT, parse_mode="HTML",
+            reply_markup=_admin_settings_keyboard(allowed or {}),
         )
         return
-
-    # ── Interactive goals editor (tree) ──
-    if action == "gedit":
-        if sub == "add":
-            await query.answer()
-            await _prompt_input(update, context, "goal_add", "➕ Reply to this with ONE goal to add:")
-            return
-        if sub == "clear":
-            await services.clear_goals(chat.id)
-            await query.answer("Cleared")
-        elif sub == "rm" and len(parts) >= 4:
-            await services.remove_goal_line(chat.id, int(parts[3]))
-            await query.answer("Removed")
-        else:
-            await query.answer()
-        lines = await services.get_goal_lines(chat.id) or []
-        body = "🎯 <b>Project Goals</b>\n" + (
-            "\n".join(f"• {ln}" for ln in lines) if lines else "<i>(no goals yet)</i>"
-        )
+    if action == "am" and sub:
+        allowed = await services.toggle_allowed_model(chat.id, sub)
+        await query.answer("Updated ✅")
         await query.edit_message_text(
-            body, parse_mode="HTML", reply_markup=_goals_editor_keyboard(lines)
+            _AI_SETTINGS_TEXT, parse_mode="HTML",
+            reply_markup=_admin_settings_keyboard(allowed or {}),
         )
         return
 
     # ── Set submenu ──
-    if action == "set" and sub == "status":
-        await query.answer(); await status_command(update, context); return  # renders st: keyboard
-    if action == "set" and sub == "goals":
-        # Open the interactive goals editor tree (Mode A update).
+    if action == "set" and sub == "names":
         await query.answer()
-        lines = await services.get_goal_lines(chat.id) or []
-        body = "🎯 <b>Project Goals</b>\n" + (
-            "\n".join(f"• {ln}" for ln in lines) if lines else "<i>(no goals yet)</i>"
-        )
-        await query.edit_message_text(
-            body, parse_mode="HTML", reply_markup=_goals_editor_keyboard(lines)
+        members = await services.list_group_members(chat.id) or []
+        current = "\n".join(
+            f"• {m['display_name']}"
+            + (f" — @{m['telegram_username']}" if m["telegram_username"] else "")
+            for m in members
+        ) or "<i>(nobody yet)</i>"
+        await _prompt_input(
+            update, context, "names_bulk",
+            "👥 <b>Who's in this group?</b>\n\n"
+            f"<b>Right now:</b>\n{current}\n\n"
+            "Reply with the whole list in one go — one person per line, "
+            "<code>Name @username</code>:\n\n"
+            "<code>Bala @balaji05\nAshok @ashok_k\nMei @meilin</code>\n\n"
+            "<i>This replaces the current list. The @handle is optional.</i>",
         )
         return
+    if action == "set" and sub == "status":
+        await query.answer(); await status_command(update, context); return  # renders st: keyboard
     if action == "set" and sub == "details":
         await query.answer()
         await _prompt_input(update, context, "details", "✏️ Reply to this with the new <b>project name</b>:")
         return
-    if action == "set" and sub == "roles":
-        await query.answer()
-        members = await services.list_members(chat.id)
-        await query.edit_message_text(
-            "👑 <b>Set Roles</b> — tap to promote/demote:", parse_mode="HTML",
-            reply_markup=_roles_keyboard(members),
-        )
-        return
-
-    # ── Role toggle ──
-    if action == "role" and len(parts) >= 4:
-        ok = await services.set_member_role(chat.id, parts[2], parts[3])
-        await query.answer("Updated ✅" if ok else "Couldn't update.", show_alert=not ok)
-        members = await services.list_members(chat.id)
-        await query.edit_message_text(
-            "👑 <b>Set Roles</b> — tap to promote/demote:", parse_mode="HTML",
-            reply_markup=_roles_keyboard(members),
-        )
-        return
-
     await query.answer()
 
 
@@ -1639,16 +1490,22 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("roast", roast_command))
     application.add_handler(CommandHandler("exams", exams_command))
     application.add_handler(CommandHandler("meme_prompt", meme_prompt_command))
-    application.add_handler(CommandHandler("sc", sc_command))
+    # /mainmenu is canonical; 'menu' and 'sc' are hidden aliases for old habits.
+    application.add_handler(CommandHandler("mainmenu", menu_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("sc", menu_command))
+    application.add_handler(CommandHandler("commands", commands_command))
     application.add_handler(CommandHandler("help", help_command))
+
+    # ── Going out ──
+    application.add_handler(CommandHandler("meetpoint", meetpoint.meetpoint_command))
 
     # ── Bills & money ──
     application.add_handler(CommandHandler("splitbill", billsplit.splitbill_command))
     application.add_handler(CommandHandler("bill", billsplit.bill_command))
     application.add_handler(CommandHandler("paynow", billsplit.paynow_command))
-    application.add_handler(CommandHandler("add_expense", add_expense_command))
-    application.add_handler(CommandHandler("list_expenses", list_expenses_command))
-    application.add_handler(CommandHandler("settle_up", settle_up_command))
+    application.add_handler(CommandHandler("splitexpense", expenses.splitexpense_command))
+    application.add_handler(CommandHandler("settle_up", settle.settle_up_command))
 
     # ── Onboarding / admin ──
     #   /activate — wakes the bot when the menu is blocked (deactivated state)
@@ -1666,6 +1523,17 @@ def register_handlers(application) -> None:
     application.add_handler(CallbackQueryHandler(on_sc_callback, pattern=r"^sc\|"))
     # Bill-split claim board (callback_data prefixed `bl|`).
     application.add_handler(CallbackQueryHandler(billsplit.on_bill_callback, pattern=r"^bl\|"))
+    # /meetpoint tree (callback_data prefixed `mp|`).
+    application.add_handler(
+        CallbackQueryHandler(meetpoint.on_meetpoint_callback, pattern=r"^mp\|")
+    )
+    # /splitexpense guided flow (`xp|`) and settle-up (`sx|`).
+    application.add_handler(
+        CallbackQueryHandler(expenses.on_expense_callback, pattern=r"^xp\|")
+    )
+    application.add_handler(
+        CallbackQueryHandler(settle.on_settle_callback, pattern=r"^sx\|")
+    )
     # Reused confirm/status/legacy sub-flows (colon-delimited prefixes).
     application.add_handler(
         CallbackQueryHandler(on_callback_query, pattern=r"^(st|clr|cd):")

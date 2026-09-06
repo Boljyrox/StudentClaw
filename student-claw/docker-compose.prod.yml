@@ -1,0 +1,40 @@
+# ============================================================================
+#  Production overrides — merge on top of docker-compose.yml.
+#
+#  Usage (on the server):
+#      docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+#  What this changes vs local dev:
+#    • Every service restarts automatically, INCLUDING after a VM reboot. The
+#      base file leaves the infra services with no restart policy, so they'd
+#      stay down after Oracle's periodic maintenance reboots and take the bot
+#      with them.
+#    • The API drops uvicorn --reload (no file-watching in production).
+#
+#  Everything else (ports, volumes, env) is inherited from docker-compose.yml.
+#  The published ports stay bound as-is; they are NOT reachable from the
+#  internet because Oracle's VCN security list only allows inbound SSH.
+# ============================================================================
+
+services:
+  api:
+    restart: unless-stopped
+    command: sh -c "python -m app.database.init_db && uvicorn main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    restart: unless-stopped
+
+  bot:
+    restart: unless-stopped
+
+  postgres:
+    restart: unless-stopped
+
+  qdrant:
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped
+
+  minio:
+    restart: unless-stopped

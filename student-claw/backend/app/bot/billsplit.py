@@ -41,6 +41,7 @@ from app.database.models import (
     Bill,
     BillClaim,
     BillItem,
+    BillRating,
     ContentType,
     PayProfile,
     Project,
@@ -192,7 +193,7 @@ async def ocr_receipt(image_bytes: bytes, mime: str = "image/jpeg") -> ParsedRec
 
         data_uri = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         resp = await client.chat.completions.create(
-            model=cfg.openrouter_model,
+            model=cfg.openrouter_vision_model,
             messages=[
                 {
                     "role": "user",
@@ -335,6 +336,7 @@ class BillView:
 
     id: str
     chat_id: int
+    kind: str
     payer_user_id: Optional[int]
     payer_name: str
     merchant: Optional[str]
@@ -355,6 +357,7 @@ def _bill_view(bill: Bill) -> BillView:
     return BillView(
         id=str(bill.id),
         chat_id=bill.chat_id,
+        kind=bill.kind,
         payer_user_id=bill.payer_user_id,
         payer_name=bill.payer_name,
         merchant=bill.merchant,
@@ -386,11 +389,50 @@ _BILL_LOAD = (
 )
 
 
+async def set_rating(bill_id: str, user_id: int, user_name: str, stars: int) -> None:
+    """Record (or change) one person's star vote for a bill."""
+    async with session_scope() as session:
+        existing = await session.scalar(
+            select(BillRating).where(
+                BillRating.bill_id == uuid.UUID(bill_id),
+                BillRating.user_id == user_id,
+            )
+        )
+        if existing is not None:
+            existing.stars = stars
+            existing.user_name = user_name[:100]
+            return
+        session.add(
+            BillRating(
+                id=uuid.uuid4(),
+                bill_id=uuid.UUID(bill_id),
+                user_id=user_id,
+                user_name=user_name[:100],
+                stars=stars,
+            )
+        )
+
+
+async def get_ratings(bill_id: str) -> tuple[float, int, list[tuple[str, int]]]:
+    """(average, count, [(name, stars)]) for a bill."""
+    async with session_scope() as session:
+        rows = (
+            await session.scalars(
+                select(BillRating).where(BillRating.bill_id == uuid.UUID(bill_id))
+            )
+        ).all()
+    if not rows:
+        return 0.0, 0, []
+    votes = [(r.user_name, int(r.stars)) for r in rows]
+    return round(sum(s for _, s in votes) / len(votes), 2), len(votes), votes
+
+
 async def create_bill(
     chat_id: int,
     payer_user_id: Optional[int],
     payer_name: str,
     receipt: ParsedReceipt,
+    kind: str = "receipt",
 ) -> Optional[BillView]:
     """Create a new open bill (cancelling any previous open one). None if the
     chat isn't registered."""
@@ -411,6 +453,7 @@ async def create_bill(
             id=uuid.uuid4(),
             project_id=project.id,
             chat_id=chat_id,
+            kind=kind,
             payer_user_id=payer_user_id,
             payer_name=payer_name[:100],
             merchant=receipt.merchant,
@@ -590,14 +633,33 @@ def _money(v: float, cur: str = "SGD") -> str:
     return f"{sym}{v:,.2f}"
 
 
+def unit_price(qty: float, total_price: float) -> float:
+    """Per-unit cost. Receipts list line totals, but people recognise the
+    per-item price ('$12 each'), so that's what we lead with."""
+    return total_price / qty if qty else total_price
+
+
+def _item_price_label(qty: float, price: float, cur: str) -> str:
+    """'2 × $12.00 = $24.00' for multiples, plain price for singles."""
+    if qty and qty != 1:
+        return f"{qty:g} × {_money(unit_price(qty, price), cur)} = {_money(price, cur)}"
+    return _money(price, cur)
+
+
 def bill_text(view: BillView) -> str:
     cur = view.currency
-    head = f"🧾 <b>{_esc(view.merchant or 'Receipt')}</b> — paid by <b>{_esc(view.payer_name)}</b>\n"
+    kind_icon = "🧾" if view.kind == "receipt" else "💸"
+    head = (
+        f"{kind_icon} <b>{_esc(view.merchant or 'Receipt')}</b> — "
+        f"paid by <b>{_esc(view.payer_name)}</b>\n"
+    )
     lines = []
     for pos, name, qty, price, claims in view.items:
-        label = _esc(name) + (f" ×{qty:g}" if qty and qty != 1 else "")
         who = ", ".join(_esc(n) for _, n in claims) if claims else "—"
-        lines.append(f"{pos + 1}. {label} · {_money(price, cur)}  <i>[{who}]</i>")
+        lines.append(
+            f"{pos + 1}. {_esc(name)} · {_item_price_label(qty, price, cur)}"
+            f"  <i>[{who}]</i>"
+        )
     charges = []
     if view.service_charge:
         charges.append(f"Svc charge {_money(view.service_charge, cur)}")
@@ -622,13 +684,18 @@ def bill_text(view: BillView) -> str:
 
 def bill_keyboard(view: BillView) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for pos, name, _qty, price, claims in view.items:
-        label = f"{pos + 1}. {name[:24]} · {price:.2f}"
+    for pos, name, qty, price, claims in view.items:
+        # Per-unit price on the button: it's what people compare against.
+        each = unit_price(qty, price)
+        label = f"{pos + 1}. {name[:22]} · {each:.2f}"
+        if qty and qty != 1:
+            label += f" ea ×{qty:g}"
         if claims:
             label += f" ✅{len(claims)}"
         rows.append(
             [InlineKeyboardButton(label, callback_data=f"bl|c|{view.id}|{pos}")]
         )
+    rows.append([InlineKeyboardButton("⭐ Rate the food", callback_data=f"bl|rate|{view.id}")])
     rows.append(
         [
             InlineKeyboardButton("✅ Split it", callback_data=f"bl|f|{view.id}"),
@@ -638,7 +705,36 @@ def bill_keyboard(view: BillView) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def breakdown_text(view: BillView, shares: list[PersonShare], notes: list[str], paynow: Optional[str]) -> str:
+def stars_keyboard(bill_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⭐" * n, callback_data=f"bl|star|{bill_id}|{n}")
+                for n in (1, 2, 3)
+            ],
+            [
+                InlineKeyboardButton("⭐" * n, callback_data=f"bl|star|{bill_id}|{n}")
+                for n in (4, 5)
+            ],
+            [InlineKeyboardButton("🔙 Back to the bill", callback_data=f"bl|back|{bill_id}")],
+        ]
+    )
+
+
+def render_stars(avg: float) -> str:
+    """Round to the nearest half star and draw it."""
+    full = int(avg)
+    half = 1 if (avg - full) >= 0.5 else 0
+    return "★" * full + ("½" if half else "") + "☆" * (5 - full - half)
+
+
+def breakdown_text(
+    view: BillView,
+    shares: list[PersonShare],
+    notes: list[str],
+    paynow: Optional[str],
+    rating: Optional[tuple[float, int]] = None,
+) -> str:
     cur = view.currency
     out = [f"💸 <b>Bill split — {_esc(view.merchant or 'receipt')}</b> (total {_money(view.total, cur)})\n"]
     for p in shares:
@@ -650,6 +746,17 @@ def breakdown_text(view: BillView, shares: list[PersonShare], notes: list[str], 
     if notes:
         out.append("")
         out.extend(f"ℹ️ {_esc(n)}" for n in notes)
+
+    # Group verdict on the food.
+    if rating and rating[1]:
+        avg, count = rating
+        out.append(
+            f"\n⭐ <b>Group rating: {render_stars(avg)} {avg:.1f}/5</b> "
+            f"<i>({count} vote{'s' if count != 1 else ''})</i>"
+        )
+    elif view.kind == "receipt":
+        out.append("\n⭐ <i>No ratings yet — tap ⭐ on the bill to rate the food.</i>")
+
     out.append("")
     payer = _esc(view.payer_name)
     if paynow:
@@ -670,44 +777,125 @@ def _is_group(update: Update) -> bool:
     return chat is not None and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
 
 
-async def _receipt_photo_bytes(update: Update) -> Optional[tuple[bytes, str]]:
-    """Find the receipt image: this message's photo, or the replied-to photo."""
+def _display_name(user) -> str:
+    if user is None:
+        return "Someone"
+    return user.first_name or (f"@{user.username}" if user.username else "Someone")
+
+
+async def _find_receipt(update: Update) -> Optional[tuple[bytes, str, Optional[object]]]:
+    """
+    Locate the receipt image and, crucially, WHO SENT IT.
+
+    Anyone can run /splitbill, so the person invoking the command is not
+    necessarily the person who paid. The uploader is the better default guess,
+    and we confirm it before charging anyone.
+
+    Returns (image_bytes, mime, uploader_user) — uploader may be None for
+    forwarded or anonymous posts.
+    """
     msg = update.effective_message
-    for candidate in (msg, msg.reply_to_message):
+    for candidate in (msg.reply_to_message, msg):
         if candidate is None:
             continue
         if candidate.photo:
             tg_file = await candidate.photo[-1].get_file()
-            return bytes(await tg_file.download_as_bytearray()), "image/jpeg"
+            data = bytes(await tg_file.download_as_bytearray())
+            return data, "image/jpeg", candidate.from_user
         doc = candidate.document
         if doc is not None and (doc.mime_type or "").startswith("image/"):
             tg_file = await doc.get_file()
-            return bytes(await tg_file.download_as_bytearray()), doc.mime_type
+            data = bytes(await tg_file.download_as_bytearray())
+            return data, doc.mime_type, candidate.from_user
     return None
 
 
+# Pending bills awaiting a "who paid?" answer, keyed by a short token so the
+# id fits comfortably inside Telegram's 64-byte callback_data limit.
+_PENDING_KEY = "splitbill_pending"
+
+
+def _payer_confirm_keyboard(token: str, has_guess: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_guess:
+        rows.append([InlineKeyboardButton("✅ Yes, they paid", callback_data=f"bl|pyes|{token}")])
+    rows.append(
+        [InlineKeyboardButton("👥 Someone else paid", callback_data=f"bl|pwho|{token}")]
+    )
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data=f"bl|pcan|{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _payer_picker_keyboard(token: str, candidates: list) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                cand.display_name[:44], callback_data=f"bl|ppick|{token}|{i}"
+            )
+        ]
+        for i, cand in enumerate(candidates)
+    ]
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data=f"bl|pcan|{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _receipt_summary(receipt: ParsedReceipt) -> str:
+    where = f" at <b>{_esc(receipt.merchant)}</b>" if receipt.merchant else ""
+    return (
+        f"🧾 Read the receipt{where} — "
+        f"<b>{_money(receipt.total, receipt.currency)}</b> "
+        f"across {len(receipt.items)} item{'s' if len(receipt.items) != 1 else ''}."
+    )
+
+
+async def _open_claim_board(
+    context: ContextTypes.DEFAULT_TYPE,
+    message,
+    chat_id: int,
+    payer_user_id: Optional[int],
+    payer_name: str,
+    receipt: ParsedReceipt,
+) -> None:
+    """Create the bill for the confirmed payer and render the claim board."""
+    view = await create_bill(chat_id, payer_user_id, payer_name, receipt)
+    if view is None:
+        await message.edit_text("⚠️ This group isn't registered yet. Send /start first.")
+        return
+    warn = ("\n\n⚠️ " + "\n⚠️ ".join(receipt.warnings)) if receipt.warnings else ""
+    sent = await message.edit_text(
+        bill_text(view) + warn, parse_mode="HTML", reply_markup=bill_keyboard(view)
+    )
+    try:
+        await set_menu_message_id(view.id, sent.message_id)
+    except Exception:  # best-effort bookkeeping
+        pass
+
+
 async def splitbill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point: OCR the receipt and open the interactive claim board."""
+    """
+    Entry point: OCR the receipt, confirm who actually paid, then open the
+    claim board.
+
+    Anyone in the group can run this — the payer is whoever the group confirms,
+    defaulting to the person who uploaded the photo rather than the person who
+    typed the command.
+    """
     msg = update.effective_message
-    user = update.effective_user
     chat = update.effective_chat
     if not _is_group(update):
         await msg.reply_text("Use /splitbill inside your group chat.")
         return
 
-    payload = await _receipt_photo_bytes(update)
-    if payload is None:
+    found = await _find_receipt(update)
+    if found is None:
         await msg.reply_text(
             "📸 Reply to a receipt photo with /splitbill (or send the photo, "
             "then reply to it). I'll read it and set up the split."
         )
         return
 
+    image_bytes, mime, uploader = found
     placeholder = await msg.reply_text("🧾 Reading the receipt… give me a few seconds.")
-    image_bytes, mime = payload
-    payer_name = (user.first_name if user else None) or (
-        f"@{user.username}" if user and user.username else "Someone"
-    )
 
     async def _work() -> None:
         try:
@@ -719,20 +907,94 @@ async def splitbill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "photo with the totals visible."
             )
             return
-        view = await create_bill(chat.id, user.id if user else None, payer_name, receipt)
-        if view is None:
-            await placeholder.edit_text("⚠️ This group isn't registered yet. Send /start first.")
-            return
-        warn = ("\n\n⚠️ " + "\n⚠️ ".join(receipt.warnings)) if receipt.warnings else ""
-        sent = await placeholder.edit_text(
-            bill_text(view) + warn, parse_mode="HTML", reply_markup=bill_keyboard(view)
+
+        token = uuid.uuid4().hex[:8]
+        guess_id = uploader.id if uploader else None
+        guess_name = _display_name(uploader) if uploader else None
+        context.chat_data.setdefault(_PENDING_KEY, {})[token] = {
+            "receipt": receipt,
+            "guess_id": guess_id,
+            "guess_name": guess_name,
+            "chat_id": chat.id,
+        }
+
+        if guess_name:
+            question = (
+                f"{_receipt_summary(receipt)}\n\n"
+                f"💳 <b>{_esc(guess_name)}</b> posted the receipt — did they pay for it?"
+            )
+        else:
+            question = (
+                f"{_receipt_summary(receipt)}\n\n"
+                "💳 I can't tell who posted the receipt. <b>Who paid?</b>"
+            )
+        await placeholder.edit_text(
+            question,
+            parse_mode="HTML",
+            reply_markup=_payer_confirm_keyboard(token, bool(guess_name)),
         )
-        try:
-            await set_menu_message_id(view.id, sent.message_id)
-        except Exception:  # best-effort bookkeeping
-            pass
 
     context.application.create_task(_work(), update=update)
+
+
+async def _handle_payer_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, token: str, arg: Optional[str]
+) -> None:
+    """The 'who paid?' step, before any bill row exists."""
+    query = update.callback_query
+    chat = update.effective_chat
+    pending = (context.chat_data.get(_PENDING_KEY) or {}).get(token)
+
+    if pending is None:
+        await query.answer("That bill setup expired — run /splitbill again.", show_alert=True)
+        return
+
+    if action == "pcan":
+        context.chat_data[_PENDING_KEY].pop(token, None)
+        await query.answer("Cancelled")
+        await query.edit_message_text("🧾 Bill split cancelled.")
+        return
+
+    if action == "pwho":
+        # Local import: app.bot.services pulls in the ORM layer, and this
+        # module is imported during handler registration.
+        from app.bot import services
+
+        candidates = await services.list_payer_candidates(chat.id)
+        if not candidates:
+            await query.answer(
+                "I don't know anyone in this group yet — add people via "
+                "/mainmenu → Set → Set names.",
+                show_alert=True,
+            )
+            return
+        pending["candidates"] = [(c.display_name, c.telegram_user_id) for c in candidates]
+        await query.answer()
+        await query.edit_message_text(
+            f"{_receipt_summary(pending['receipt'])}\n\n💳 <b>Who paid?</b>",
+            parse_mode="HTML",
+            reply_markup=_payer_picker_keyboard(token, candidates),
+        )
+        return
+
+    if action == "pyes":
+        payer_id, payer_name = pending["guess_id"], pending["guess_name"]
+    elif action == "ppick":
+        stored = pending.get("candidates") or []
+        try:
+            payer_name, payer_id = stored[int(arg or -1)]
+        except (ValueError, IndexError):
+            await query.answer("That option expired — try again.", show_alert=True)
+            return
+    else:
+        await query.answer()
+        return
+
+    context.chat_data[_PENDING_KEY].pop(token, None)
+    await query.answer("Setting up…")
+    await _open_claim_board(
+        context, query.message, chat.id, payer_id, payer_name, pending["receipt"]
+    )
 
 
 async def bill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -782,11 +1044,19 @@ async def on_bill_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if query is None or user is None:
         return
-    parts = (query.data or "").split("|")  # ["bl", action, bill_id, pos?]
+    parts = (query.data or "").split("|")  # ["bl", action, bill_id|token, pos?]
     if len(parts) < 3:
         await query.answer()
         return
     action, bill_id = parts[1], parts[2]
+
+    # "Who paid?" runs before a bill row exists, so it's keyed by a pending
+    # token rather than a bill id — route it out before any DB lookup.
+    if action in {"pyes", "pwho", "ppick", "pcan"}:
+        await _handle_payer_callback(
+            update, context, action, bill_id, parts[3] if len(parts) > 3 else None
+        )
+        return
 
     if action == "c" and len(parts) >= 4:
         name = user.first_name or (f"@{user.username}" if user.username else "Someone")
@@ -811,6 +1081,54 @@ async def on_bill_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Bill not found.", show_alert=True)
         return
 
+    # ── Ratings: open to everyone, not just the payer ──
+    if action == "rate":
+        await query.answer()
+        avg, count, _ = await get_ratings(view.id)
+        header = (
+            f"⭐ Current: <b>{render_stars(avg)} {avg:.1f}/5</b> from {count} "
+            f"vote{'s' if count != 1 else ''}\n\n"
+            if count
+            else "⭐ No votes yet.\n\n"
+        )
+        await query.edit_message_text(
+            f"{header}<b>How was the food at "
+            f"{_esc(view.merchant or 'this place')}?</b>\nEveryone can vote once.",
+            parse_mode="HTML",
+            reply_markup=stars_keyboard(view.id),
+        )
+        return
+
+    if action == "star" and len(parts) >= 4:
+        try:
+            stars = max(1, min(5, int(parts[3])))
+        except ValueError:
+            await query.answer()
+            return
+        voter = user.first_name or (f"@{user.username}" if user.username else "Someone")
+        await set_rating(view.id, user.id, voter, stars)
+        avg, count, _ = await get_ratings(view.id)
+        await query.answer(f"You rated {stars}★")
+        await query.edit_message_text(
+            f"⭐ <b>{render_stars(avg)} {avg:.1f}/5</b> from {count} "
+            f"vote{'s' if count != 1 else ''}\n\n"
+            f"<b>How was the food at {_esc(view.merchant or 'this place')}?</b>\n"
+            "Tap to change your vote.",
+            parse_mode="HTML",
+            reply_markup=stars_keyboard(view.id),
+        )
+        return
+
+    if action == "back":
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                bill_text(view), parse_mode="HTML", reply_markup=bill_keyboard(view)
+            )
+        except Exception:
+            pass
+        return
+
     # Only the payer may finalise/cancel.
     if view.payer_user_id is not None and user.id != view.payer_user_id:
         await query.answer(f"Only {view.payer_name} (who paid) can do that.", show_alert=True)
@@ -829,9 +1147,28 @@ async def on_bill_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         await set_bill_status(view.id, "finalized")
         await query.answer("Splitting…")
+
+        # Freeze who owes whom so it shows up in the pending-expenses summary
+        # and can be marked paid / confirmed later.
+        from app.bot import settle
+
+        await settle.record_debts(
+            view.id, view.chat_id, view.payer_user_id, view.payer_name, shares
+        )
+
         paynow = await get_pay_profile(view.payer_user_id)
-        text = breakdown_text(view, shares, notes, paynow)
-        await query.edit_message_text(text, parse_mode="HTML")
+        avg, count, _ = await get_ratings(view.id)
+        text = breakdown_text(view, shares, notes, paynow, (avg, count))
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⭐ Rate the food", callback_data=f"bl|rate|{view.id}")],
+                    [InlineKeyboardButton("💰 Pending expenses", callback_data="sx|open")],
+                ]
+            ),
+        )
 
         chat = update.effective_chat
         # PayNow QR so people can just scan and pay.

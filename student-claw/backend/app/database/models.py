@@ -29,6 +29,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Enum as SAEnum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -718,7 +719,14 @@ class Bill(Base):
     )
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
-    # The person who paid the bill (ran /splitbill) and should be reimbursed.
+    # "receipt" — OCR'd from a photo via /splitbill.
+    # "expense" — typed by hand via /splitexpense (no image).
+    # Both live in this table so there is exactly ONE split + settle engine.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'receipt'")
+    )
+
+    # The person who paid the bill and should be reimbursed.
     payer_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     payer_name: Mapped[str] = mapped_column(String(100), nullable=False)
 
@@ -870,6 +878,162 @@ class PayProfile(Base):
         return f"<PayProfile user={self.telegram_user_id} paynow={self.paynow_id!r}>"
 
 
+# ===========================================================================
+# bill_ratings  (how the group rated the food, 1-5 stars)
+# ===========================================================================
+class BillRating(Base):
+    """One person's star rating for a bill. Averaged into the final summary."""
+
+    __tablename__ = "bill_ratings"
+    __table_args__ = (
+        UniqueConstraint("bill_id", "user_id", name="uq_bill_rating_user"),
+        Index("ix_bill_ratings_bill_id", "bill_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    bill_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("bills.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    user_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    stars: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<BillRating {self.user_name!r} {self.stars}★>"
+
+
+# ===========================================================================
+# bill_debts  (who owes whom, frozen at finalise time)
+# ===========================================================================
+class BillDebt(Base):
+    """
+    One person's debt to the payer of one bill.
+
+    Written when a bill is finalised rather than derived on the fly: the split
+    must be frozen at that moment (later claim edits shouldn't silently rewrite
+    a debt someone has already settled), and payment state needs somewhere to
+    live. Aggregating these across bills is what powers the pending-expenses
+    summary.
+
+    Lifecycle:  created → paid_at (debtor says they paid)
+                        → confirmed_at (creditor verifies) = settled
+    """
+
+    __tablename__ = "bill_debts"
+    __table_args__ = (
+        Index("ix_bill_debts_chat_id", "chat_id"),
+        Index("ix_bill_debts_bill_id", "bill_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    bill_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("bills.id", ondelete="CASCADE"), nullable=False
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    debtor_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    debtor_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    creditor_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    creditor_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    # Debtor pressed "I've paid" — awaiting the creditor's confirmation.
+    paid_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Creditor confirmed receipt. Non-null == fully settled.
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = _created_at()
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<BillDebt {self.debtor_name}→{self.creditor_name} {self.amount}>"
+
+
+# ===========================================================================
+# group_memories  (long-term facts Agnes has been told to remember)
+# ===========================================================================
+class GroupMemory(Base):
+    """
+    A single discrete fact about the group ("Bala's DDW exam is on 12 Nov").
+
+    Kept separate from message_logs on purpose: message logs are raw history,
+    these are curated facts the group can list, edit and delete individually.
+    Entries older than MEMORY_RETENTION_DAYS are pruned automatically.
+    """
+
+    __tablename__ = "group_memories"
+    __table_args__ = (Index("ix_group_memories_project_id", "project_id"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # "user" (explicitly asked to remember) or "auto" (agent-extracted).
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    created_by_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<GroupMemory {self.content[:40]!r}>"
+
+
+# ===========================================================================
+# member_locations  (home locations for /meetpoint)
+# ===========================================================================
+class MemberLocation(Base):
+    """
+    Where a member is travelling from, used to find a fair meeting point.
+
+    Stored per project so the same person can have different starting points in
+    different groups (home vs hall, say).
+    """
+
+    __tablename__ = "member_locations"
+    __table_args__ = (
+        UniqueConstraint("project_id", "display_name", name="uq_member_location_name"),
+        Index("ix_member_locations_project_id", "project_id"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    telegram_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    telegram_username: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # What the user typed (postal code or free-text address).
+    raw_input: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Resolved by OneMap geocoding.
+    address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    postal_code: Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<MemberLocation {self.display_name!r} @ {self.postal_code}>"
+
+
 __all__ = [
     "Base",
     # enums (python)
@@ -897,4 +1061,8 @@ __all__ = [
     "BillClaim",
     "GroupMember",
     "PayProfile",
+    "GroupMemory",
+    "MemberLocation",
+    "BillRating",
+    "BillDebt",
 ]

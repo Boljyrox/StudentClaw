@@ -32,23 +32,17 @@ _application: Application | None = None
 
 # Default commands shown in Telegram's "/" menu (chat-scoped menus override
 # these per group mode — see app.bot.modes).
-_BOT_COMMANDS = [
-    ("ask", "Ask Agnes anything"),
-    ("summary", "Catch me up on the chat"),
-    ("news", "Today's news, summarised"),
-    ("joke", "An actually funny joke"),
-    ("roast", "Roast someone (with love)"),
-    ("exams", "Upcoming exams & deadlines"),
-    ("splitbill", "Split a receipt photo"),
-    ("paynow", "Set your PayNow number"),
-    ("sc", "Open the Agnes menu"),
-]
+# Single source of truth lives in app.bot.modes.COMMAND_CATALOGUE.
+def _bot_commands():
+    from app.bot.modes import default_commands
+
+    return default_commands()
 
 
 async def _post_init(application: Application) -> None:
     """Register the command menu + start the Redis notification listener."""
     try:
-        await application.bot.set_my_commands(_BOT_COMMANDS)
+        await application.bot.set_my_commands(_bot_commands())
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Could not set bot command menu: %s", exc)
 

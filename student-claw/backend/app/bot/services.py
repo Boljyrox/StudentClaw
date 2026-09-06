@@ -16,15 +16,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from app.bot.keys import derive_project_key, vector_namespace_for
 from app.database.connection import session_scope
 from app.database.models import (
     ContentType,
-    Expense,
     GroupMember,
+    GroupMemory,
     LinkedVia,
+    MemberLocation,
     MemberRole,
     MessageLog,
     Project,
@@ -468,6 +469,22 @@ def model_allowed(allowed: dict, key: str) -> bool:
     return bool(allowed.get(key, True))
 
 
+async def set_model_choice(chat_id: int, choice: str) -> Optional[dict]:
+    """Set which provider the router should use (auto / agnes / openrouter)."""
+    from app.ai.routing import MODEL_CHOICE_KEY, VALID_CHOICES
+
+    if choice not in VALID_CHOICES:
+        return None
+    async with session_scope() as session:
+        p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if p is None:
+            return None
+        models = dict(p.allowed_models or {})
+        models[MODEL_CHOICE_KEY] = choice
+        p.allowed_models = models  # reassign so SQLAlchemy flushes the JSONB
+        return models
+
+
 async def toggle_allowed_model(chat_id: int, key: str) -> Optional[dict]:
     async with session_scope() as session:
         p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
@@ -552,102 +569,6 @@ async def remove_group_member(chat_id: int, member_id: str) -> bool:
             return False
         await session.delete(member)
         return True
-
-
-# ---------------------------------------------------------------------------
-# Mode C — Expense Tracker
-# ---------------------------------------------------------------------------
-async def add_expense(
-    chat_id: int, payer_name: str, payer_uid: Optional[int], amount: float, description: Optional[str]
-) -> bool:
-    async with session_scope() as session:
-        p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
-        if p is None:
-            return False
-        session.add(
-            Expense(
-                project_id=p.id,
-                payer_name=payer_name[:100],
-                payer_telegram_user_id=payer_uid,
-                amount=round(amount, 2),
-                description=(description or "")[:300] or None,
-            )
-        )
-        return True
-
-
-async def list_expenses(chat_id: int, limit: int = 20) -> Optional[list[dict]]:
-    async with session_scope() as session:
-        p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
-        if p is None:
-            return None
-        rows = (
-            await session.scalars(
-                select(Expense)
-                .where(Expense.project_id == p.id)
-                .order_by(Expense.created_at.desc())
-                .limit(limit)
-            )
-        ).all()
-    return [
-        {"payer": e.payer_name, "amount": float(e.amount), "description": e.description}
-        for e in rows
-    ]
-
-
-async def compute_balances(chat_id: int) -> Optional[dict]:
-    """Split every expense equally across members ∪ payers; return net + settlements."""
-    async with session_scope() as session:
-        p = await session.scalar(select(Project).where(Project.chat_id == chat_id))
-        if p is None:
-            return None
-        expenses = (
-            await session.scalars(select(Expense).where(Expense.project_id == p.id))
-        ).all()
-        member_names = (
-            await session.execute(
-                select(Student.display_name)
-                .join(StudentProject, StudentProject.student_id == Student.id)
-                .where(StudentProject.project_id == p.id)
-            )
-        ).all()
-
-    paid: dict[str, float] = {}
-    total = 0.0
-    for e in expenses:
-        paid[e.payer_name] = paid.get(e.payer_name, 0.0) + float(e.amount)
-        total += float(e.amount)
-
-    participants = {r[0] for r in member_names} | set(paid.keys())
-    if not participants or total == 0:
-        return {"total": round(total, 2), "balances": [], "settlements": [], "count": len(expenses)}
-
-    share = total / len(participants)
-    balances = {name: round(paid.get(name, 0.0) - share, 2) for name in participants}
-
-    # Greedy settlement: debtors pay creditors.
-    debtors = sorted(([n, -b] for n, b in balances.items() if b < -0.009), key=lambda x: x[1])
-    creditors = sorted(([n, b] for n, b in balances.items() if b > 0.009), key=lambda x: -x[1])
-    settlements: list[tuple[str, str, float]] = []
-    i = j = 0
-    while i < len(debtors) and j < len(creditors):
-        owe, recv = debtors[i], creditors[j]
-        amt = round(min(owe[1], recv[1]), 2)
-        if amt > 0:
-            settlements.append((owe[0], recv[0], amt))
-        owe[1] -= amt
-        recv[1] -= amt
-        if owe[1] <= 0.009:
-            i += 1
-        if recv[1] <= 0.009:
-            j += 1
-
-    return {
-        "total": round(total, 2),
-        "balances": sorted(balances.items(), key=lambda x: x[1]),
-        "settlements": settlements,
-        "count": len(expenses),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -809,3 +730,437 @@ async def log_agent_interaction(
                 received_at=now,
             )
         )
+
+
+# ---------------------------------------------------------------------------
+# Long-term group memory
+# ---------------------------------------------------------------------------
+# Facts the group asked Agnes to remember. Distinct from message history: these
+# are curated, individually addressable, and expire after one month.
+@dataclass
+class MemoryItem:
+    id: str
+    content: str
+    source: str
+    created_by_name: Optional[str]
+    created_at: datetime
+
+    @property
+    def age_days(self) -> int:
+        return (datetime.now(timezone.utc) - self.created_at).days
+
+
+async def _prune_memories(session, project_id: uuid.UUID) -> int:
+    """Drop anything past the retention window. Returns rows removed."""
+    from app.ai.config import MEMORY_RETENTION_DAYS
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MEMORY_RETENTION_DAYS)
+    result = await session.execute(
+        delete(GroupMemory).where(
+            GroupMemory.project_id == project_id, GroupMemory.created_at < cutoff
+        )
+    )
+    return result.rowcount or 0
+
+
+async def list_memories(chat_id: int) -> Optional[list[MemoryItem]]:
+    """All live memories, oldest first so the numbering is stable over a session."""
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return None
+        await _prune_memories(session, project.id)
+        rows = (
+            await session.scalars(
+                select(GroupMemory)
+                .where(GroupMemory.project_id == project.id)
+                .order_by(GroupMemory.created_at)
+            )
+        ).all()
+        return [
+            MemoryItem(
+                id=str(r.id),
+                content=r.content,
+                source=r.source,
+                created_by_name=r.created_by_name,
+                created_at=r.created_at,
+            )
+            for r in rows
+        ]
+
+
+async def add_memory(
+    chat_id: int,
+    content: str,
+    *,
+    source: str = "user",
+    user_id: Optional[int] = None,
+    user_name: Optional[str] = None,
+) -> Optional[str]:
+    """Store one fact. Near-duplicates are ignored so repeats don't pile up."""
+    content = (content or "").strip()
+    if not content:
+        return None
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return None
+        existing = await session.scalar(
+            select(GroupMemory).where(
+                GroupMemory.project_id == project.id,
+                func.lower(GroupMemory.content) == content.lower(),
+            )
+        )
+        if existing is not None:
+            return str(existing.id)
+        row = GroupMemory(
+            id=uuid.uuid4(),
+            project_id=project.id,
+            content=content[:2000],
+            source=source,
+            created_by_user_id=user_id,
+            created_by_name=user_name,
+        )
+        session.add(row)
+        await session.flush()
+        return str(row.id)
+
+
+async def update_memory(chat_id: int, memory_id: str, content: str) -> bool:
+    content = (content or "").strip()
+    if not content:
+        return False
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return False
+        row = await session.scalar(
+            select(GroupMemory).where(
+                GroupMemory.project_id == project.id,
+                GroupMemory.id == uuid.UUID(memory_id),
+            )
+        )
+        if row is None:
+            return False
+        row.content = content[:2000]
+        return True
+
+
+async def delete_memory(chat_id: int, memory_id: str) -> bool:
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return False
+        result = await session.execute(
+            delete(GroupMemory).where(
+                GroupMemory.project_id == project.id,
+                GroupMemory.id == uuid.UUID(memory_id),
+            )
+        )
+        return (result.rowcount or 0) > 0
+
+
+async def clear_memories(chat_id: int) -> Optional[int]:
+    """Wipe every memory for the group. Returns how many were removed."""
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return None
+        result = await session.execute(
+            delete(GroupMemory).where(GroupMemory.project_id == project.id)
+        )
+        return result.rowcount or 0
+
+
+async def search_memories(chat_id: int, query: str, limit: int = 5) -> list[MemoryItem]:
+    """
+    Keyword match over memories, ranked by how many query words they contain.
+    Deliberately simple — the candidate set is small and the result always goes
+    through a human confirmation step before anything is deleted.
+    """
+    items = await list_memories(chat_id) or []
+    words = {w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) > 2}
+    if not words:
+        return []
+    scored: list[tuple[int, MemoryItem]] = []
+    for item in items:
+        haystack = item.content.lower()
+        hits = sum(1 for w in words if w in haystack)
+        if hits:
+            scored.append((hits, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# Member locations (/meetpoint)
+# ---------------------------------------------------------------------------
+@dataclass
+class LocationItem:
+    id: str
+    display_name: str
+    telegram_user_id: Optional[int]
+    telegram_username: Optional[str]
+    raw_input: str
+    address: Optional[str]
+    postal_code: Optional[str]
+    latitude: Optional[float]
+    longitude: Optional[float]
+
+    @property
+    def has_coords(self) -> bool:
+        return self.latitude is not None and self.longitude is not None
+
+
+def _location_item(row: MemberLocation) -> LocationItem:
+    return LocationItem(
+        id=str(row.id),
+        display_name=row.display_name,
+        telegram_user_id=row.telegram_user_id,
+        telegram_username=row.telegram_username,
+        raw_input=row.raw_input,
+        address=row.address,
+        postal_code=row.postal_code,
+        latitude=row.latitude,
+        longitude=row.longitude,
+    )
+
+
+async def list_locations(chat_id: int) -> Optional[list[LocationItem]]:
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return None
+        rows = (
+            await session.scalars(
+                select(MemberLocation)
+                .where(MemberLocation.project_id == project.id)
+                .order_by(MemberLocation.display_name)
+            )
+        ).all()
+        return [_location_item(r) for r in rows]
+
+
+async def upsert_location(
+    chat_id: int,
+    display_name: str,
+    raw_input: str,
+    *,
+    telegram_user_id: Optional[int] = None,
+    telegram_username: Optional[str] = None,
+    address: Optional[str] = None,
+    postal_code: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+) -> bool:
+    """Set (or replace) where one person travels from."""
+    display_name = (display_name or "").strip()[:100]
+    if not display_name:
+        return False
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return False
+        row = await session.scalar(
+            select(MemberLocation).where(
+                MemberLocation.project_id == project.id,
+                func.lower(MemberLocation.display_name) == display_name.lower(),
+            )
+        )
+        if row is None:
+            row = MemberLocation(
+                id=uuid.uuid4(),
+                project_id=project.id,
+                display_name=display_name,
+                raw_input=raw_input[:255],
+            )
+            session.add(row)
+        row.raw_input = raw_input[:255]
+        row.telegram_user_id = telegram_user_id
+        row.telegram_username = telegram_username
+        row.address = (address or None) and address[:255]
+        row.postal_code = (postal_code or None) and postal_code[:12]
+        row.latitude = latitude
+        row.longitude = longitude
+        return True
+
+
+async def remove_location(chat_id: int, location_id: str) -> bool:
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return False
+        result = await session.execute(
+            delete(MemberLocation).where(
+                MemberLocation.project_id == project.id,
+                MemberLocation.id == uuid.UUID(location_id),
+            )
+        )
+        return (result.rowcount or 0) > 0
+
+
+async def clear_locations(chat_id: int) -> bool:
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return False
+        await session.execute(
+            delete(MemberLocation).where(MemberLocation.project_id == project.id)
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Bulk roster entry ("Name @handle" per line)
+# ---------------------------------------------------------------------------
+_ROSTER_LINE = re.compile(r"^\s*(.+?)\s*[@＠]\s*([A-Za-z0-9_]{3,50})\s*$")
+_BARE_HANDLE = re.compile(r"^\s*[@＠]\s*([A-Za-z0-9_]{3,50})\s*$")
+
+
+def parse_roster_block(text: str) -> tuple[list[tuple[str, Optional[str]]], list[str]]:
+    """
+    Parse a pasted block of "Name @handle" lines (one per line).
+
+    Handles are optional — a line that is just a name still registers the
+    person. Returns (parsed, rejected_lines) so the caller can report exactly
+    which lines didn't make sense instead of silently dropping them.
+    """
+    parsed: list[tuple[str, Optional[str]]] = []
+    rejected: list[str] = []
+    seen: set[str] = set()
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip().strip(",;")
+        if not line:
+            continue
+        match = _ROSTER_LINE.match(line)
+        bare_handle = _BARE_HANDLE.match(line)
+        if bare_handle:
+            # "@meilin" with no name — use the handle as the display name.
+            handle = bare_handle.group(1)
+            name = handle
+        elif match:
+            name, handle = match.group(1).strip(), match.group(2).strip()
+        elif "@" not in line and len(line) <= 100:
+            name, handle = line, None
+        else:
+            rejected.append(raw_line.strip())
+            continue
+
+        name = re.sub(r"\s+", " ", name).strip(" -–—:")
+        # A name containing '@' means the line was malformed (e.g. stray @s),
+        # not a real "Name @handle" pair.
+        if not name or "@" in name:
+            rejected.append(raw_line.strip())
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed.append((name[:100], handle))
+
+    return parsed, rejected
+
+
+async def replace_group_members(
+    chat_id: int, entries: list[tuple[str, Optional[str]]], added_by: Optional[int] = None
+) -> Optional[int]:
+    """
+    Replace the whole roster in one shot (the bulk-paste flow).
+    Returns the number of members stored, or None if the group is unknown.
+    """
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return None
+        await session.execute(
+            delete(GroupMember).where(GroupMember.project_id == project.id)
+        )
+        for name, handle in entries:
+            session.add(
+                GroupMember(
+                    id=uuid.uuid4(),
+                    project_id=project.id,
+                    display_name=name,
+                    telegram_username=handle,
+                    added_by_user_id=added_by,
+                )
+            )
+        return len(entries)
+
+
+# ---------------------------------------------------------------------------
+# Payer candidates (/splitbill "who actually paid?")
+# ---------------------------------------------------------------------------
+@dataclass
+class PayerCandidate:
+    display_name: str
+    telegram_user_id: Optional[int]
+
+    @property
+    def key(self) -> str:
+        return (self.display_name or "").strip().lower()
+
+
+async def list_payer_candidates(chat_id: int, limit: int = 25) -> list[PayerCandidate]:
+    """
+    People who could plausibly have paid, newest-talker first.
+
+    Two sources, in priority order:
+      1. message_logs — everyone who has actually spoken. These carry a real
+         telegram_user_id, which matters because the payer's id is what gates
+         finalising the bill and what looks up their PayNow number.
+      2. group_members — the admin-curated roster, so quiet members and
+         lurkers still show up (name only, no id).
+    """
+    async with session_scope() as session:
+        project = await session.scalar(select(Project).where(Project.chat_id == chat_id))
+        if project is None:
+            return []
+
+        rows = (
+            await session.execute(
+                select(
+                    MessageLog.sender_telegram_username,
+                    MessageLog.sender_telegram_user_id,
+                )
+                .where(
+                    MessageLog.chat_id == chat_id,
+                    MessageLog.deleted_at.is_(None),
+                    MessageLog.sender_telegram_username.is_not(None),
+                )
+                .order_by(MessageLog.received_at.desc())
+                .limit(600)
+            )
+        ).all()
+
+        roster = (
+            await session.scalars(
+                select(GroupMember)
+                .where(GroupMember.project_id == project.id)
+                .order_by(GroupMember.display_name.asc())
+            )
+        ).all()
+
+    out: list[PayerCandidate] = []
+    seen: set[str] = set()
+
+    for name, uid in rows:
+        if not name or name == "Agnes":
+            continue
+        cand = PayerCandidate(display_name=name, telegram_user_id=uid)
+        if cand.key in seen:
+            continue
+        seen.add(cand.key)
+        out.append(cand)
+
+    for member in roster:
+        cand = PayerCandidate(display_name=member.display_name, telegram_user_id=None)
+        # Prefer the chat-log entry when the same person appears in both, since
+        # only that one carries a usable telegram_user_id.
+        if cand.key in seen:
+            continue
+        seen.add(cand.key)
+        out.append(cand)
+
+    return out[:limit]

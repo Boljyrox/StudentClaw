@@ -153,7 +153,7 @@ async def _run_vlm_extraction(image_bytes: bytes, mime: str = "jpeg") -> str:
     data_uri = f"data:image/{mime};base64,{b64}"
 
     response = await client.chat.completions.create(
-        model=cfg.openrouter_model,
+        model=cfg.openrouter_vision_model,
         messages=[
             {"role": "system", "content": _VLM_SYSTEM_PROMPT},
             {

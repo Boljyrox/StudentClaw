@@ -18,12 +18,13 @@ from zoneinfo import ZoneInfo
 
 _SGT = ZoneInfo("Asia/Singapore")
 
-from app.ai import repository, tools
+from app.ai import repository, routing, tools
 from app.ai.clients import get_agnes_client, get_openrouter_client
 from app.ai.observability import logged_chat
 from app.ai.config import (
     AGENT_MAX_ITERATIONS,
     AGENT_TIMEOUT_SECONDS,
+    MEMORY_PROMPT_LIMIT,
     MEMORY_TURNS,
     RECENT_MESSAGE_WINDOW,
     get_ai_settings,
@@ -87,6 +88,7 @@ def build_system_prompt(
     memory: list[repository.RecentMessage] | None = None,
     participants: list[str] | None = None,
     roster: list[tuple[str, str | None]] | None = None,
+    facts: list[str] | None = None,
 ) -> str:
     """Assemble the system prompt with roster, clock and short-term memory."""
     # Manual roster first (name → handle, admin-curated), then anyone else
@@ -117,11 +119,16 @@ def build_system_prompt(
         or "(no prior turns)"
     )
 
-    # Mode persona — shifts tone per group mode.
-    from app.bot.modes import persona_for
+    # LONG-TERM MEMORY — curated facts the group asked Agnes to remember.
+    # Numbered so the agent can refer to "memory 3" the same way the user sees it.
+    fact_lines = (
+        "\n".join(f"{i}) {f}" for i, f in enumerate(facts or [], start=1))
+        or "(nothing saved yet)"
+    )
 
-    persona = persona_for(ctx.group_mode)
-    persona_block = f"{persona}\n\n" if persona else ""
+    from app.bot.modes import PERSONA
+
+    persona_block = f"{PERSONA}\n\n"
 
     now_sg = datetime.now(timezone.utc).astimezone(_SGT)
 
@@ -135,6 +142,8 @@ def build_system_prompt(
         f"time (UTC+8) — use this for countdowns and anything time-relative.\n\n"
         f"PEOPLE IN THIS CHAT (member list is admin-curated — when someone "
         f"refers to a person by name, match them via this list)\n{people_lines}\n\n"
+        f"SAVED MEMORY (facts this group asked you to remember — treat as "
+        f"true and current)\n{fact_lines}\n\n"
         f"SHORT-TERM MEMORY (most recent turns — use to stay consistent with the "
         f"ongoing conversation)\n{memory_lines}\n\n"
         f"RECENT MESSAGES (oldest first)\n{recent_lines}\n\n"
@@ -156,12 +165,28 @@ def _signature(name: str, raw_args: str) -> str:
 
 
 async def _run_loop(
-    chat_id: int, messages: list[dict[str, Any]], *, mode: str | None = None
+    chat_id: int,
+    messages: list[dict[str, Any]],
+    *,
+    provider: str = "agnes",
 ) -> str:
-    client = get_agnes_client()
-    model = get_ai_settings().chat_model
+    """
+    Bounded tool-calling loop against the chosen provider.
+
+    Agnes is the default; `provider="openrouter"` is used only when the router
+    judged the request complex enough to be worth paying for.
+    """
+    settings = get_ai_settings()
+    openrouter = get_openrouter_client() if provider == "openrouter" else None
+    if openrouter is not None:
+        # Complex request and OpenRouter is configured — use the stronger model.
+        client, model = openrouter, settings.openrouter_reasoning_model
+    else:
+        # Default path, and the safety net when OpenRouter isn't configured.
+        client, model = get_agnes_client(), settings.chat_model
+
     seen_signatures: set[str] = set()
-    toolset = tools.tools_for_mode(mode)
+    toolset = tools.all_tools()
 
     for iteration in range(1, AGENT_MAX_ITERATIONS + 1):
         response = await logged_chat(
@@ -278,12 +303,15 @@ async def run_agent(
     *,
     history: Optional[list[dict[str, Any]]] = None,
     system_directive: Optional[str] = None,
+    force_complex: bool = False,
 ) -> str:
     """
-    Top-level entrypoint. Loads project context + short-term memory, builds the
-    prompt, runs the bounded loop under a 30s budget, and returns Telegram-HTML
-    text. On Agnes failure/timeout it falls back to OpenRouter/Gemini, appending
-    a "⚡ Processed via Gemini Fallback" note. Never raises.
+    Top-level entrypoint. Loads context, roster and saved memory, builds the
+    prompt, picks a provider (Agnes unless the request looks genuinely complex),
+    runs the bounded loop under a 30s budget, and returns Telegram-HTML text.
+
+    `force_complex` skips the heuristic and goes straight to the stronger model.
+    Never raises.
     """
     ctx = await repository.load_project_context(chat_id)
     if ctx is None:
@@ -294,10 +322,19 @@ async def run_agent(
     participants = await repository.load_chat_participants(chat_id)
     roster = await repository.load_group_roster(chat_id)
 
+    # Curated long-term facts (bounded so the prompt can't grow without limit).
+    from app.bot import services as bot_services
+
+    facts = [
+        m.content for m in (await bot_services.list_memories(chat_id) or [])
+    ][-MEMORY_PROMPT_LIMIT:]
+
     base_messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": build_system_prompt(ctx, recent, memory, participants, roster),
+            "content": build_system_prompt(
+                ctx, recent, memory, participants, roster, facts
+            ),
         }
     ]
     if system_directive:
@@ -306,20 +343,43 @@ async def run_agent(
         base_messages.extend(history)
     base_messages.append({"role": "user", "content": user_message})
 
-    # Primary: Agnes (with tools), bounded by the timeout. Pass a copy so the
-    # clean base_messages survive for the fallback.
+    # Route: Agnes handles everything unless the request is genuinely hard.
+    decision = routing.choose_provider(
+        user_message,
+        allowed=ctx.allowed_models,
+        openrouter_available=get_openrouter_client() is not None,
+        force_complex=force_complex,
+    )
+    logger.info(
+        "Routing chat_id=%s -> %s (%s)", chat_id, decision.provider, decision.reason
+    )
+
     try:
-        return await asyncio.wait_for(
-            _run_loop(chat_id, list(base_messages), mode=ctx.group_mode),
+        answer = await asyncio.wait_for(
+            _run_loop(chat_id, list(base_messages), provider=decision.provider),
             timeout=AGENT_TIMEOUT_SECONDS,
         )
+        if answer:
+            return answer + (FALLBACK_NOTE if decision.is_openrouter else "")
+        logger.warning("Empty answer from %s for chat_id=%s.", decision.provider, chat_id)
     except asyncio.TimeoutError:
         logger.warning("Agent timed out (%ss) for chat_id=%s; trying fallback.", AGENT_TIMEOUT_SECONDS, chat_id)
     except Exception as exc:
         logger.exception("Agent error for chat_id=%s; trying fallback: %s", chat_id, exc)
 
-    # Gemini fallback — only if the admin hasn't disabled it (/admin_settings).
-    if ctx.allowed_models.get("gemini_fallback", True):
+    # Fallback. If the primary attempt was already OpenRouter there's nothing
+    # better to escalate to, so retry plainly on Agnes instead.
+    if decision.is_openrouter:
+        try:
+            answer = await asyncio.wait_for(
+                _run_loop(chat_id, list(base_messages), provider="agnes"),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+            if answer:
+                return answer
+        except Exception as exc:
+            logger.warning("Agnes retry also failed for chat_id=%s: %s", chat_id, exc)
+    elif ctx.allowed_models.get("gemini_fallback", True):
         fallback = await _openrouter_fallback(base_messages, chat_id=chat_id)
         if fallback:
             return f"{fallback}{FALLBACK_NOTE}"

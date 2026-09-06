@@ -16,10 +16,17 @@ it into features people use daily:
 | 📚 `/exams` | Saved exam/deadline dates **with timings and countdowns** (SGT). Add naturally: `/exams add Linear Algebra final, 12 Aug 9–11am`. |
 | 💬 `/ask <anything>` | General questions — or just **@mention Agnes / reply to her** in chat. |
 | 💸 `/add_expense`, `/settle_up` | Quick shared-expense ledger with who-pays-whom. |
+| 📍 `/meetpoint` | Everyone drops a postal code, picks what they feel like doing, and Agnes proposes 5 spots — then sends **each person their own** public-transport directions. |
+| 🧠 `/mainmenu` → Memory | See, edit or delete everything Agnes remembers. Also works conversationally: *"/ask forget the memory about the DDW exam"* (always confirms first). |
 
-Group modes (picked at `/init`) tune her persona: Friends/Chill, Bills &
-Makan, Study & Exams, Trips & Events, and a **legacy Projects mode** that keeps
-the old task-delegation tooling.
+There are **no modes** — every group gets every feature. `/init` just claims
+the admin and switches Agnes on. `/commands` lists everything she can do.
+
+**Model routing.** Agnes AI handles all everyday chat because it's free. A
+heuristic (`app/ai/routing.py`) escalates only genuinely hard requests —
+multi-step reasoning, code, analysis, calculations — to OpenRouter. Admins can
+force this either way under `/mainmenu` → 🤖 AI (Auto / Agnes-only / Always
+OpenRouter), and it defaults to Auto.
 
 ```
 Telegram group ──► Bot (python-telegram-bot)
@@ -31,9 +38,11 @@ Telegram group ──► Bot (python-telegram-bot)
    Qdrant (vectors)   └─ Redis (queue + pub/sub)
 ```
 
-Image, receipt and scanned-PDF OCR is handled by **Qwen 2.5 VL 72B** via the
-[OpenRouter](https://openrouter.ai) API (with Agnes vision as fallback) — no
-local Tesseract installation required.
+Image, receipt and scanned-PDF OCR is handled by **Qwen3-VL 32B** via the
+[OpenRouter](https://openrouter.ai) API — no local Tesseract needed. OpenRouter
+is used in three distinct roles, each its own env var: a cheap text model for
+the fallback, a reasoning model for complex questions, and this vision model
+for OCR.
 
 > **Legacy web dashboard** — this repo also contains the original "Student
 > Claw" Next.js project-management dashboard (`student-claw/frontend/` plus the
@@ -51,8 +60,7 @@ local Tesseract installation required.
 | **uv** | latest | Fast Python package manager. `pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **Docker** + Docker Compose | any recent | Easiest way to run Postgres / Qdrant / Redis / MinIO. |
 
-> No Tesseract binary needed — OCR is handled by the Qwen 2.5 VL 72B vision
-> model via OpenRouter.
+> No Tesseract binary needed — OCR is handled by a vision model via OpenRouter.
 
 ---
 
@@ -102,11 +110,17 @@ You need **four** external credentials. Collect them before filling in `.env`.
 1. Sign up at **https://openrouter.ai** and add a credit balance.
 2. Go to **Keys** → **Create key** → copy the key.
 3. Set `OPENROUTER_API_KEY` in `backend/.env`.
-4. The defaults are pre-configured:
-   - `OPENROUTER_BASE_URL` = `https://openrouter.ai/api/v1`
-   - `OPENROUTER_MODEL` = `qwen/qwen2.5-vl-72b-instruct`
+4. The defaults are pre-configured — **three separate roles**, don't collapse
+   them into one variable:
+   - `OPENROUTER_MODEL` = `google/gemini-2.5-flash-lite` — cheap, fast text
+     fallback. Must be non-reasoning; a reasoning model burns tokens thinking
+     before every casual reply.
+   - `OPENROUTER_REASONING_MODEL` = `deepseek/deepseek-v4-flash` — used only
+     for requests `app/ai/routing.py` judges complex.
+   - `OPENROUTER_VISION_MODEL` = `qwen/qwen3-vl-32b-instruct` — receipt and
+     document OCR. **Must accept image input** (DeepSeek text models do not).
 
-   You can swap in any other OpenRouter vision model without changing code.
+   Any OpenRouter model can be swapped in without code changes.
 
 ### 3d. Google Calendar OAuth2 (optional — deadline sync)
 1. Go to **https://console.cloud.google.com** → create/select a project.
@@ -303,7 +317,9 @@ cd backend && .venv/bin/python -m app.bot.bot
 | `CORS_ORIGINS` | | Comma-separated allowed browser origins. |
 | `OPENROUTER_API_KEY` | ✅ | OpenRouter key for VLM image/PDF OCR. |
 | `OPENROUTER_BASE_URL` | | Default `https://openrouter.ai/api/v1`. |
-| `OPENROUTER_MODEL` | | Default `qwen/qwen2.5-vl-72b-instruct`. |
+| `OPENROUTER_MODEL` | | Cheap text fallback. Default `google/gemini-2.5-flash-lite`. |
+| `OPENROUTER_REASONING_MODEL` | | Complex requests only. Default `deepseek/deepseek-v4-flash`. |
+| `OPENROUTER_VISION_MODEL` | | OCR; must accept images. Default `qwen/qwen3-vl-32b-instruct`. |
 
 ### Frontend (`frontend/.env`)
 | Variable | Required | Description |

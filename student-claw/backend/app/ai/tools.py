@@ -2,9 +2,10 @@
 Agnes AI tool definitions + executors.
 
 Holds the OpenAI-standard function schemas and the server-side handlers that
-execute them. The toolset is mode-aware: every group gets chat-history search
-and date saving; the legacy "projects" mode additionally keeps the old
-task-delegation and contribution-scoring tools.
+execute them. Every group gets the same toolset: chat-history search, saving
+and listing important dates, and saving/listing long-term memory. The older
+task-delegation and contribution-scoring executors are kept reachable for the
+legacy web dashboard but are no longer advertised to the model.
 
 Security invariant: the authoritative `chat_id` is injected by the backend on
 every call; any `chat_id` the model emits in its arguments is IGNORED and
@@ -219,17 +220,85 @@ _CONTRIBUTION_TOOL = {
     },
 }
 
-# Every mode gets these.
-_CORE_TOOLS: list[dict[str, Any]] = [_SEARCH_TOOL, _SAVE_DATE_TOOL, _LIST_DATES_TOOL]
+_REMEMBER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "remember_fact",
+        "description": (
+            "Save one durable fact about this group so you can recall it in "
+            "future conversations — someone's exam date, a recurring plan, a "
+            "preference, an inside joke. Use it when the group explicitly asks "
+            "you to remember something, or when a clearly durable fact is "
+            "stated. Do NOT use it for passing chatter; ordinary messages are "
+            "already searchable via search_chat_history. Facts expire after "
+            "one month."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Provided by the system context; never infer it.",
+                },
+                "fact": {
+                    "type": "string",
+                    "description": (
+                        "The fact as one self-contained sentence, e.g. "
+                        "\"Bala's DDW exam is on 12 November\". Include names "
+                        "so it makes sense on its own."
+                    ),
+                    "maxLength": 300,
+                },
+            },
+            "required": ["chat_id", "fact"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_RECALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_saved_memory",
+        "description": (
+            "List the facts you've saved about this group. Use it when asked "
+            "what you remember, or to check whether something is already saved "
+            "before saving it again."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Provided by the system context; never infer it.",
+                },
+            },
+            "required": ["chat_id"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# One group, one toolset — there are no modes any more.
+_CORE_TOOLS: list[dict[str, Any]] = [
+    _SEARCH_TOOL,
+    _SAVE_DATE_TOOL,
+    _LIST_DATES_TOOL,
+    _REMEMBER_TOOL,
+    _RECALL_TOOL,
+]
 
 # Kept for backwards compatibility with existing imports.
 TOOLS: list[dict[str, Any]] = _CORE_TOOLS
 
 
-def tools_for_mode(mode: str | None) -> list[dict[str, Any]]:
-    """The toolset exposed to the agent for a given group mode."""
-    if mode == "projects":
-        return _CORE_TOOLS + [_DELEGATE_TASK_TOOL, _CONTRIBUTION_TOOL]
+def all_tools() -> list[dict[str, Any]]:
+    """The toolset exposed to the agent (identical for every group)."""
+    return _CORE_TOOLS
+
+
+def tools_for_mode(_mode: str | None = None) -> list[dict[str, Any]]:
+    """Deprecated alias kept so older call sites keep working."""
     return _CORE_TOOLS
 
 
@@ -289,6 +358,34 @@ async def execute_tool(name: str, arguments: dict[str, Any], *, chat_id: int) ->
                     "dates": [
                         {"title": d.title, "due_date": d.due_date.isoformat()}
                         for d in dates
+                    ],
+                }
+            )
+
+        # Memory writes are additive only. Deletion deliberately has no tool:
+        # it always goes through an explicit in-chat confirmation instead.
+        if name == "remember_fact":
+            from app.bot import services as bot_services
+
+            memory_id = await bot_services.add_memory(
+                chat_id, args["fact"], source="auto"
+            )
+            if memory_id is None:
+                return json.dumps({"ok": False, "detail": "Group not registered."})
+            return json.dumps({"ok": True, "detail": "Saved to memory.", "id": memory_id})
+
+        if name == "list_saved_memory":
+            from app.bot import services as bot_services
+
+            items = await bot_services.list_memories(chat_id)
+            if items is None:
+                return json.dumps({"ok": False, "detail": "Group not registered."})
+            return json.dumps(
+                {
+                    "ok": True,
+                    "memories": [
+                        {"index": i, "fact": m.content}
+                        for i, m in enumerate(items, start=1)
                     ],
                 }
             )
