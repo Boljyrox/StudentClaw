@@ -91,7 +91,10 @@ services:
       - redisdata:/data
 
   minio:
-    image: minio/minio:latest
+    # Pulled from Quay, not Docker Hub: MinIO gated `docker.io/minio/minio`,
+    # which now fails with "pull access denied" on a clean machine. Quay is
+    # MinIO's other official registry and needs no login.
+    image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
